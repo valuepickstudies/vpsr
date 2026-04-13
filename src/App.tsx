@@ -22,13 +22,18 @@ import {
   Zap,
   Anchor,
   Shield,
-  Radar
+  Radar,
+  Activity
 } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
 import { format } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, LabelList } from 'recharts';
 import Markdown from 'react-markdown';
 import html2canvas from 'html2canvas';
 import { marked } from 'marked';
+import { auth, googleProvider, db } from './firebase';
+import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot, collection, addDoc, deleteDoc } from 'firebase/firestore';
 
 const STRATEGIES = [
   { id: 'VALUE_BUYS', label: 'Deep Value', desc: 'Low P/E, Low P/B, Margin of Safety', icon: <Wallet size={20} className="text-emerald-500" />, bgClass: 'bg-emerald-50', textClass: 'text-emerald-600', premium: false },
@@ -58,10 +63,71 @@ type SavedCompany = {
   name: string;
   url: string;
   exchange: string;
+  symbol: string;
 };
 
+type PortfolioItem = {
+  id: string;
+  type: 'SIP' | 'Lumpsum';
+  name: string;
+  amount: number;
+  date: string;
+  description?: string;
+};
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'all' | 'results' | 'companies' | 'saved' | 'scanners'>('all');
+  const [activeTab, setActiveTab] = useState<'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio'>('discover');
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +147,11 @@ export default function App() {
   const [showReport, setShowReport] = useState(false);
   const chartsRef = useRef<HTMLDivElement>(null);
 
+  // Snapshot State
+  const [snapshotData, setSnapshotData] = useState<{ name: string; snapshot: string } | null>(null);
+  const [loadingSnapshot, setLoadingSnapshot] = useState(false);
+  const [showSnapshotModal, setShowSnapshotModal] = useState(false);
+
   // Saved Companies State
   const [savedCompanies, setSavedCompanies] = useState<SavedCompany[]>(() => {
     const saved = localStorage.getItem('savedCompanies');
@@ -92,24 +163,238 @@ export default function App() {
   const [scannerResults, setScannerResults] = useState<any[]>([]);
   const [loadingScanner, setLoadingScanner] = useState(false);
   const [isPaidCustomer, setIsPaidCustomer] = useState(false);
+  const [country, setCountry] = useState<'IN' | 'US'>('IN');
+
+  // Feature Flags
+  const [visiblePages, setVisiblePages] = useState({
+    discover: true,
+    all: true,
+    companies: true,
+    saved: true,
+    scanners: true,
+    portfolio: false,
+  });
+
+  const [portfolioItems, setPortfolioItems] = useState<PortfolioItem[]>([]);
+  const [portfolioForm, setPortfolioForm] = useState<Omit<PortfolioItem, 'id'>>({
+    type: 'SIP',
+    name: '',
+    amount: 0,
+    date: new Date().toISOString().split('T')[0],
+    description: '',
+  });
+  const [portfolioSearchQuery, setPortfolioSearchQuery] = useState('');
+  const [portfolioSearchResults, setPortfolioSearchResults] = useState<any[]>([]);
+  const [isSearchingPortfolio, setIsSearchingPortfolio] = useState(false);
+  const [showPortfolioResults, setShowPortfolioResults] = useState(false);
+
+  // Auth State
+  const [user, setUser] = useState<User | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+
+  useEffect(() => {
+    // Listen for feature flags
+    const unsubFlags = onSnapshot(collection(db, 'featureFlags'), (snapshot) => {
+      const updates: any = {};
+      snapshot.forEach((doc) => {
+        updates[doc.id] = doc.data().enabled;
+      });
+      setVisiblePages(prev => ({ ...prev, ...updates }));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'featureFlags');
+    });
+
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      if (currentUser) {
+        try {
+          const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
+          setIsAdmin((userDoc.exists() && userDoc.data().role === 'admin') || currentUser.email === 'valuepicks25@gmail.com');
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `users/${currentUser.uid}`);
+        }
+      } else {
+        setIsAdmin(false);
+      }
+    });
+
+    // Listen for portfolio items
+    const unsubPortfolio = onSnapshot(collection(db, 'portfolio'), (snapshot) => {
+      const items: PortfolioItem[] = [];
+      snapshot.forEach((doc) => {
+        items.push({ id: doc.id, ...doc.data() } as PortfolioItem);
+      });
+      setPortfolioItems(items);
+    }, (error) => {
+      // Gracefully handle permission denied if visibility is off
+      if (error.code !== 'permission-denied') {
+        handleFirestoreError(error, OperationType.LIST, 'portfolio');
+      } else {
+        setPortfolioItems([]);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      unsubFlags();
+      unsubPortfolio();
+    };
+  }, []);
+
+  const togglePageVisibility = async (page: string, isVisible: boolean) => {
+    if (!isAdmin) return;
+    try {
+      await setDoc(doc(db, 'featureFlags', page), { enabled: !isVisible });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `featureFlags/${page}`);
+    }
+  };
+
+  const addPortfolioItem = async () => {
+    if (!isAdmin) return;
+    try {
+      await addDoc(collection(db, 'portfolio'), portfolioForm);
+      setPortfolioForm({
+        type: 'SIP',
+        name: '',
+        amount: 0,
+        date: new Date().toISOString().split('T')[0],
+        description: '',
+      });
+      setPortfolioSearchQuery('');
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'portfolio');
+    }
+  };
+
+  const deletePortfolioItem = async (id: string) => {
+    if (!isAdmin) return;
+    try {
+      await deleteDoc(doc(db, 'portfolio', id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `portfolio/${id}`);
+    }
+  };
+
+  const handleLogin = async () => {
+    if (isLoggingIn) return;
+    setIsLoggingIn(true);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err: any) {
+      if (err.code === 'auth/popup-blocked') {
+        alert("Please enable popups for this site to log in.");
+      } else if (err.code === 'auth/cancelled-popup-request') {
+        console.log("Popup request cancelled by user or another request.");
+      } else {
+        console.error("Login failed:", err);
+      }
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
+    window.location.reload();
+  };
 
   useEffect(() => {
     localStorage.setItem('savedCompanies', JSON.stringify(savedCompanies));
   }, [savedCompanies]);
 
+  useEffect(() => {
+    const searchPortfolioCompanies = async () => {
+      if (portfolioSearchQuery.length >= 3) {
+        setIsSearchingPortfolio(true);
+        try {
+          const json = await fetchJSON(`/api/companies?search=${encodeURIComponent(portfolioSearchQuery)}&country=${country}`);
+          if (json.success) {
+            setPortfolioSearchResults(json.data);
+            setShowPortfolioResults(true);
+          }
+        } catch (err) {
+          console.error("Portfolio search failed", err);
+        } finally {
+          setIsSearchingPortfolio(false);
+        }
+      } else {
+        setPortfolioSearchResults([]);
+        setShowPortfolioResults(false);
+      }
+    };
+
+    const timer = setTimeout(searchPortfolioCompanies, 300);
+    return () => clearTimeout(timer);
+  }, [portfolioSearchQuery, country]);
+
+  const fetchJSON = async (url: string, options?: RequestInit, retryCount = 0): Promise<any> => {
+    try {
+      const res = await fetch(url, options);
+      const contentType = res.headers.get("content-type");
+      
+      if (!res.ok) {
+        let errorMessage = `Server error: ${res.status} ${res.statusText}`;
+        if (contentType && contentType.includes("application/json")) {
+          try {
+            const errorJson = await res.json();
+            errorMessage = errorJson.error || errorMessage;
+          } catch (e) {
+            // Fallback to default message
+          }
+        } else {
+          const text = await res.text();
+          console.error(`Non-JSON error response from ${url}:`, text.substring(0, 200));
+          
+          // If we get "Starting Server" HTML, it's a transient state
+          if (text.includes("<title>Starting Server...</title>") && retryCount < 1) {
+            console.log(`Server still starting, retrying ${url} in 2s...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            return fetchJSON(url, options, retryCount + 1);
+          }
+        }
+        throw new Error(errorMessage);
+      }
+
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error(`Expected JSON but got ${contentType} from ${url}:`, text.substring(0, 200));
+        
+        // Retry for HTML responses that might be transient
+        if (text.includes("<!doctype html>") && retryCount < 1) {
+          console.log(`Received HTML instead of JSON, retrying ${url} in 2s...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          return fetchJSON(url, options, retryCount + 1);
+        }
+        
+        throw new Error("Invalid response format from server. Please try again.");
+      }
+
+      return res.json();
+    } catch (err: any) {
+      if (retryCount < 1 && err.message === "Failed to fetch") {
+        // Network errors also worth a single retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        return fetchJSON(url, options, retryCount + 1);
+      }
+      throw err;
+    }
+  };
+
   const runScanner = async (id: string) => {
     setSelectedScanner(id);
     setLoadingScanner(true);
     try {
-      const res = await fetch(`/api/scanners/${id}`);
-      const json = await res.json();
+      const json = await fetchJSON(`/api/scanners/${id}?country=${country}`);
       if (json.success) {
         setScannerResults(json.data);
       } else {
         setScannerResults([]);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to run scanner", err);
+      setError(err.message || "Failed to run scanner");
       setScannerResults([]);
     } finally {
       setLoadingScanner(false);
@@ -120,8 +405,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/announcements?type=${type}`);
-      const json = await res.json();
+      const json = await fetchJSON(`/api/announcements?type=${type}&country=${country}`);
       if (json.success) {
         setAnnouncements(json.data);
       } else {
@@ -138,13 +422,13 @@ export default function App() {
     if (e.key === 'Enter' && searchQuery.trim()) {
       setSearchingCompanies(true);
       try {
-        const res = await fetch(`/api/companies?search=${encodeURIComponent(searchQuery)}`);
-        const json = await res.json();
+        const json = await fetchJSON(`/api/companies?search=${encodeURIComponent(searchQuery)}&country=${country}`);
         if (json.success) {
           setCompanies(json.data);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to search companies", err);
+        setError(err.message || "Failed to search companies");
       } finally {
         setSearchingCompanies(false);
       }
@@ -157,15 +441,9 @@ export default function App() {
     setCompanyData(null);
     setShowReport(false);
     setReportData(null);
+    setError(null);
     try {
-      const res = await fetch(`/api/company/fundamentals?url=${encodeURIComponent(company.url)}`);
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Non-JSON response received:", text.substring(0, 200));
-        throw new Error("Server returned an invalid response. Please try again later.");
-      }
-      const json = await res.json();
+      const json = await fetchJSON(`/api/company/fundamentals?url=${encodeURIComponent(company.url)}&country=${country}`);
       if (json.success) {
         setCompanyData(json.data);
       } else {
@@ -183,74 +461,38 @@ export default function App() {
     if (!selectedCompany) return;
     setLoadingReport(true);
     setShowReport(true);
+    setError(null);
     try {
-      const res = await fetch(`/api/company/report?url=${encodeURIComponent(selectedCompany.url)}`);
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Non-JSON response received:", text.substring(0, 200));
-        throw new Error("Server returned an invalid response. Please try again later.");
-      }
-      const json = await res.json();
+      const json = await fetchJSON(`/api/company/report?url=${encodeURIComponent(selectedCompany.url)}&country=${country}`);
       if (json.success) {
-        const data = json.data;
-        
-        let aiReport = "AI analysis is currently unavailable.";
-        try {
-          const { GoogleGenAI } = await import("@google/genai");
-          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-          const prompt = `You are an expert financial analyst. Write a comprehensive, world-class equity research report for ${data.name}. 
-          
-Ensure you analyze the LATEST available data, including recent quarterly results and any recent exchange filings.
-
-Annual Profit & Loss Data:
-${JSON.stringify(data.chartData)}
-
-Recent Quarterly Results (Last 4 Quarters):
-${JSON.stringify(data.quarterlyData.slice(-4))}
-
-Recent BSE Result Announcements (Latest filings):
-${JSON.stringify(data.recentAnnouncements.map((a: any) => ({ date: a.date, subject: a.subject })))}
-
-Structure the report EXACTLY with the following sections, providing detailed, professional insights for each:
-1. **Investment Thesis & Summary**: A strong opening paragraph summarizing the core investment case, current performance, and why the stock is interesting right now.
-2. **Business Model & Operations**: How the company makes money, its core segments, and operational footprint.
-3. **Historical Financial Review**: Deep dive into the provided annual and quarterly data. Highlight revenue growth, margin expansion/contraction, and EPS trends. Use exact numbers.
-4. **Growth Drivers & Catalysts**: What will drive future growth? Reference recent announcements, capacity expansions, or new market entries.
-5. **Risk Assessment**: Key vulnerabilities (market, regulatory, competition, geopolitical, valuation).
-6. **Valuation & Price Target**: Assess the current valuation based on the EPS and growth trends, and provide a hypothetical forward-looking perspective.
-7. **Management Quality & Governance**: Assessment of management's capital allocation, promoter holding (if known), and strategic decisions.
-8. **Competitive Positioning**: The company's moat, peers, and industry standing.
-
-Use markdown formatting. Make it read like a premium institutional research report. Keep it engaging, analytical, and data-driven.
-
-**Constraints:**
-- Originality: No repetition, plagiarism, or recycled content. Verify uniqueness and accuracy to the latest updated information.
-
-**Avoid Pitfalls:**
-- Don't use cliché personal experiences or anecdotes and phrases. 
-- Steer clear of generic advice (e.g., "always plan for failure"). 
-- Don't overwhelm with excessive code or math; prioritize intuition and visuals. 
-- Ensure explanations are detailed but not overwhelming.`;
-
-          const aiResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt,
-          });
-          
-          aiReport = aiResponse.text || aiReport;
-        } catch (aiError: any) {
-          console.error("Gemini API Error:", aiError);
-          aiReport = `**AI Analysis Unavailable**\n\nError: ${aiError.message || "Failed to generate report"}\n\n*If you are seeing an API key error, please open the Settings menu (gear icon) and remove the invalid GEMINI_API_KEY to use the default free key.*`;
-        }
-
-        setReportData({ ...data, aiReport });
+        setReportData(json.data);
+      } else {
+        throw new Error(json.error || "Failed to fetch report data from server");
       }
-    } catch (err) {
-      console.error("Failed to generate report", err);
+    } catch (err: any) {
+      console.error("Failed to generate report:", err);
+      setError(err.message || "Failed to generate report");
     } finally {
       setLoadingReport(false);
+    }
+  };
+
+  const generateSnapshot = async (company: SavedCompany) => {
+    setLoadingSnapshot(true);
+    setShowSnapshotModal(true);
+    setSnapshotData(null);
+    try {
+      const json = await fetchJSON(`/api/company/snapshot?url=${encodeURIComponent(company.url)}&country=${country}`);
+      if (json.success) {
+        setSnapshotData(json.data);
+      } else {
+        throw new Error(json.error || "Failed to generate snapshot");
+      }
+    } catch (err: any) {
+      console.error("Failed to generate snapshot:", err);
+      setSnapshotData({ name: company.name, snapshot: `Error: ${err.message}` });
+    } finally {
+      setLoadingSnapshot(false);
     }
   };
 
@@ -357,13 +599,13 @@ Use markdown formatting. Make it read like a premium institutional research repo
   };
 
   useEffect(() => {
-    if (activeTab === 'all' || activeTab === 'results') {
-      fetchAnnouncements(activeTab);
+    if (activeTab === 'all' || activeTab === 'results' || activeTab === 'discover') {
+      fetchAnnouncements(activeTab === 'discover' ? 'results' : activeTab);
       setSelectedCompany(null);
     } else if (activeTab === 'saved') {
       setSelectedCompany(null);
     }
-  }, [activeTab]);
+  }, [activeTab, country]);
 
   const filteredAnnouncements = announcements.filter(a => 
     a.companyName.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -379,11 +621,48 @@ Use markdown formatting. Make it read like a premium institutional research repo
       <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between h-16 items-center">
-            <div className="flex items-center gap-2">
-              <TrendingUp className="h-6 w-6 text-blue-600" />
-              <h1 className="text-xl font-bold tracking-tight text-gray-900">Market Intelligence</h1>
+            <div className="flex items-center gap-6">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="h-6 w-6 text-blue-600" />
+                <h1 className="text-xl font-bold tracking-tight text-gray-900">Market Intelligence</h1>
+              </div>
+              
+              <div className="flex items-center bg-gray-100 p-1 rounded-lg">
+                <button
+                  onClick={() => setCountry('IN')}
+                  className={`px-3 py-1 text-xs font-bold rounded-md transition-all ${
+                    country === 'IN' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  🇮🇳 INDIA
+                </button>
+                <button
+                  onClick={() => setCountry('US')}
+                  className={`px-3 py-1 text-xs font-bold rounded-md transition-all ${
+                    country === 'US' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  🇺🇸 USA
+                </button>
+              </div>
             </div>
             <div className="flex items-center gap-4">
+              {user ? (
+                <button
+                  onClick={handleLogout}
+                  className="text-sm font-medium text-gray-600 hover:text-gray-900"
+                >
+                  Logout
+                </button>
+              ) : (
+                <button
+                  onClick={handleLogin}
+                  disabled={isLoggingIn}
+                  className={`text-sm font-medium ${isLoggingIn ? 'text-gray-400 cursor-not-allowed' : 'text-blue-600 hover:text-blue-800'}`}
+                >
+                  {isLoggingIn ? 'Logging in...' : 'Login'}
+                </button>
+              )}
               <button
                 onClick={() => setIsPaidCustomer(!isPaidCustomer)}
                 className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition-all ${
@@ -415,15 +694,28 @@ Use markdown formatting. Make it read like a premium institutional research repo
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Tabs */}
         <div className="flex space-x-1 bg-gray-100 p-1 rounded-lg w-fit mb-8 overflow-x-auto">
-          <button
-            onClick={() => setActiveTab('all')}
-            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
-              activeTab === 'all' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
-            }`}
-          >
-            <FileText className="h-4 w-4" />
-            All Announcements
-          </button>
+          {isAdmin && (
+            <button
+              onClick={() => setActiveTab('admin')}
+              className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+                activeTab === 'admin' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+              }`}
+            >
+              <Shield className="h-4 w-4" />
+              Admin
+            </button>
+          )}
+          {visiblePages.all && (
+            <button
+              onClick={() => setActiveTab('all')}
+              className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+                activeTab === 'all' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+              }`}
+            >
+              <FileText className="h-4 w-4" />
+              All Announcements
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('results')}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -451,6 +743,17 @@ Use markdown formatting. Make it read like a premium institutional research repo
             <Radar className="h-4 w-4" />
             Stock Scanners
           </button>
+          {(visiblePages.portfolio || isAdmin) && (
+            <button
+              onClick={() => setActiveTab('portfolio')}
+              className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+                activeTab === 'portfolio' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+              }`}
+            >
+              <BarChart3 className="h-4 w-4" />
+              Portfolio
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('saved')}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -464,6 +767,283 @@ Use markdown formatting. Make it read like a premium institutional research repo
 
         {/* Content Area */}
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+          {activeTab === 'admin' && (
+            <div className="p-6 bg-white rounded-xl border border-gray-200 shadow-sm">
+              <h2 className="text-xl font-bold text-gray-900 mb-4">Admin Dashboard</h2>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <div className="space-y-4">
+                  <h3 className="font-semibold text-gray-800">Page Visibility</h3>
+                  {Object.entries(visiblePages).map(([page, isVisible]) => (
+                    <div key={page} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                      <span className="capitalize text-gray-700">{page}</span>
+                      <button
+                        onClick={() => togglePageVisibility(page, isVisible)}
+                        className={`px-3 py-1 rounded-md text-sm font-medium ${
+                          isVisible ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                        }`}
+                      >
+                        {isVisible ? 'Visible' : 'Hidden'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="space-y-4">
+                  <h3 className="font-semibold text-gray-800">Add Portfolio Item</h3>
+                  <div className="space-y-3 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Type</label>
+                      <select 
+                        value={portfolioForm.type}
+                        onChange={(e) => setPortfolioForm({...portfolioForm, type: e.target.value as any})}
+                        className="w-full text-sm border border-gray-300 rounded-md px-3 py-2"
+                      >
+                        <option value="SIP">SIP</option>
+                        <option value="Lumpsum">One-time Investment</option>
+                      </select>
+                    </div>
+                    <div className="relative">
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Name</label>
+                      <input 
+                        type="text"
+                        value={portfolioSearchQuery || portfolioForm.name}
+                        onChange={(e) => {
+                          setPortfolioSearchQuery(e.target.value);
+                          setPortfolioForm({...portfolioForm, name: e.target.value});
+                        }}
+                        placeholder="Type 3 letters to search stocks..."
+                        className="w-full text-sm border border-gray-300 rounded-md px-3 py-2"
+                      />
+                      {showPortfolioResults && portfolioSearchResults.length > 0 && (
+                        <div className="absolute z-20 w-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg max-h-48 overflow-y-auto">
+                          {portfolioSearchResults.map((company) => (
+                            <button
+                              key={company.symbol}
+                              onClick={() => {
+                                setPortfolioForm({
+                                  ...portfolioForm,
+                                  name: company.companyName
+                                });
+                                setPortfolioSearchQuery(company.companyName);
+                                setShowPortfolioResults(false);
+                              }}
+                              className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 transition-colors border-b border-gray-50 last:border-0"
+                            >
+                              <div className="font-medium text-gray-900">{company.companyName}</div>
+                              <div className="text-[10px] text-gray-500">{company.symbol} • {company.exchange}</div>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {isSearchingPortfolio && (
+                        <div className="absolute right-3 top-8">
+                          <RefreshCw className="h-3 w-3 text-blue-500 animate-spin" />
+                        </div>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Amount (₹)</label>
+                      <input 
+                        type="number"
+                        value={portfolioForm.amount}
+                        onChange={(e) => setPortfolioForm({...portfolioForm, amount: Number(e.target.value)})}
+                        className="w-full text-sm border border-gray-300 rounded-md px-3 py-2"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Date</label>
+                      <input 
+                        type="date"
+                        value={portfolioForm.date}
+                        onChange={(e) => setPortfolioForm({...portfolioForm, date: e.target.value})}
+                        className="w-full text-sm border border-gray-300 rounded-md px-3 py-2"
+                      />
+                    </div>
+                    <button 
+                      onClick={addPortfolioItem}
+                      className="w-full bg-blue-600 text-white text-sm font-medium py-2 rounded-md hover:bg-blue-700 transition-colors"
+                    >
+                      Add to Portfolio
+                    </button>
+                  </div>
+
+                  <div className="mt-6">
+                    <h4 className="text-sm font-medium text-gray-700 mb-3">Current Portfolio Items</h4>
+                    <div className="space-y-2 max-h-60 overflow-y-auto">
+                      {portfolioItems.map(item => (
+                        <div key={item.id} className="flex justify-between items-center p-2 bg-white border border-gray-200 rounded text-sm">
+                          <div>
+                            <p className="font-medium">{item.name}</p>
+                            <p className="text-xs text-gray-500">₹{item.amount.toLocaleString()} • {item.type}</p>
+                          </div>
+                          <button 
+                            onClick={() => deletePortfolioItem(item.id)}
+                            className="text-red-500 hover:text-red-700 p-1"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {activeTab === 'portfolio' && (
+            <div className="p-6">
+              <div className="mb-8">
+                <h2 className="text-2xl font-bold text-gray-900 mb-2">Portfolio Showcase</h2>
+                <p className="text-gray-600">A curated view of strategic investments and SIPs.</p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {portfolioItems.map((item) => (
+                  <div key={item.id} className="bg-white rounded-xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-all">
+                    <div className="flex justify-between items-start mb-4">
+                      <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
+                        item.type === 'SIP' ? 'bg-emerald-50 text-emerald-700' : 'bg-blue-50 text-blue-700'
+                      }`}>
+                        {item.type}
+                      </div>
+                      <div className="text-sm font-bold text-gray-900">
+                        ₹{item.amount.toLocaleString()}
+                      </div>
+                    </div>
+                    <h3 className="text-lg font-bold text-gray-900 mb-2">{item.name}</h3>
+                    <div className="flex items-center gap-2 text-xs text-gray-500 mb-4">
+                      <Calendar className="h-3.5 w-3.5" />
+                      Started: {format(new Date(item.date), 'MMM dd, yyyy')}
+                    </div>
+                    {item.description && (
+                      <p className="text-sm text-gray-600 line-clamp-2">{item.description}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {portfolioItems.length === 0 && (
+                <div className="text-center py-20 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200">
+                  <BarChart3 className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+                  <h3 className="text-lg font-medium text-gray-900">No portfolio items to show</h3>
+                  <p className="text-gray-500">Check back later for investment updates.</p>
+                </div>
+              )}
+            </div>
+          )}
+          {activeTab === 'discover' && (
+            <div className="p-6">
+              <div className="flex justify-between items-center mb-6">
+                <div>
+                  <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                    <Sparkles className="h-5 w-5 text-amber-500" />
+                    Discover New Results
+                  </h2>
+                  <p className="text-sm text-gray-500">Companies that recently announced their financial performance</p>
+                </div>
+                <button 
+                  onClick={() => fetchAnnouncements('results')}
+                  className="flex items-center gap-2 text-sm font-medium text-blue-600 hover:text-blue-800"
+                >
+                  <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+                  Refresh
+                </button>
+              </div>
+
+              {loading && announcements.length === 0 ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {[1, 2, 3, 4, 5, 6].map(i => (
+                    <div key={i} className="animate-pulse bg-gray-50 rounded-xl p-6 border border-gray-100 h-48"></div>
+                  ))}
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {announcements.filter(a => a.category === 'Result').slice(0, 12).map((item) => (
+                    <div key={item.id} className="group bg-white rounded-xl p-6 border border-gray-200 hover:border-blue-300 hover:shadow-md transition-all">
+                      <div className="flex justify-between items-start mb-4">
+                        <div className="bg-blue-50 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider">
+                          {item.exchange}
+                        </div>
+                        <span className="text-[10px] text-gray-400 font-medium">
+                          {item.date ? format(new Date(item.date), 'MMM dd, HH:mm') : 'N/A'}
+                        </span>
+                      </div>
+                      
+                      <h3 className="font-bold text-gray-900 mb-1 line-clamp-1 group-hover:text-blue-600 transition-colors">
+                        {item.companyName}
+                      </h3>
+                      <p className="text-xs text-gray-500 mb-4 font-mono">{item.symbol}</p>
+                      
+                      <div className="text-xs text-gray-600 mb-6 line-clamp-2 h-8 italic">
+                        "{item.subject}"
+                      </div>
+                      
+                      <div className="flex items-center gap-2 mt-auto">
+                        <button
+                          onClick={() => {
+                            const companyUrl = country === 'IN' 
+                              ? `https://www.screener.in/company/${item.symbol}/`
+                              : `https://finance.yahoo.com/quote/${item.symbol}`;
+                            
+                            const company: SavedCompany = {
+                              id: item.symbol,
+                              name: item.companyName,
+                              url: companyUrl,
+                              exchange: item.exchange,
+                              symbol: item.symbol
+                            };
+                            openCompanyDashboard(company);
+                          }}
+                          className="flex-1 flex items-center justify-center gap-2 py-2 bg-blue-600 text-white text-xs font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
+                        >
+                          <Sparkles className="h-3.5 w-3.5" />
+                          AI Analysis
+                        </button>
+                        <button
+                          onClick={() => {
+                            const companyUrl = country === 'IN' 
+                              ? `https://www.screener.in/company/${item.symbol}/`
+                              : `https://finance.yahoo.com/quote/${item.symbol}`;
+                            
+                            const company: SavedCompany = {
+                              id: item.symbol,
+                              name: item.companyName,
+                              url: companyUrl,
+                              exchange: item.exchange,
+                              symbol: item.symbol
+                            };
+                            generateSnapshot(company);
+                          }}
+                          className="flex-1 flex items-center justify-center gap-2 py-2 bg-indigo-50 text-indigo-700 text-xs font-bold rounded-lg hover:bg-indigo-100 transition-colors border border-indigo-100"
+                        >
+                          <Activity className="h-3.5 w-3.5" />
+                          Snapshot
+                        </button>
+                        {item.pdfLink && (
+                          <a 
+                            href={item.pdfLink}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="p-2 bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 transition-colors"
+                            title="View PDF"
+                          >
+                            <ExternalLink className="h-4 w-4" />
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {announcements.filter(a => a.category === 'Result').length === 0 && (
+                    <div className="col-span-full py-20 text-center text-gray-500 bg-gray-50 rounded-xl border border-dashed border-gray-300">
+                      <FileText className="h-10 w-10 mx-auto mb-3 text-gray-300" />
+                      <p>No recent results found. Try refreshing or changing country.</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {(activeTab === 'all' || activeTab === 'results') && (
             <div className="p-6">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
@@ -542,19 +1122,65 @@ Use markdown formatting. Make it read like a premium institutional research repo
                               </span>
                             </td>
                             <td className="px-4 py-3 text-right">
-                              {item.pdfLink ? (
-                                <a 
-                                  href={item.pdfLink} 
-                                  target="_blank" 
-                                  rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 font-medium"
-                                >
-                                  View PDF
-                                  <ExternalLink className="h-4 w-4" />
-                                </a>
-                              ) : (
-                                <span className="text-gray-400">No Document</span>
-                              )}
+                              <div className="flex items-center justify-end gap-3">
+                                {item.category === 'Result' && (
+                                  <>
+                                    <button
+                                      onClick={() => {
+                                        const companyUrl = country === 'IN' 
+                                          ? `https://www.screener.in/company/${item.symbol}/`
+                                          : `https://finance.yahoo.com/quote/${item.symbol}`;
+                                        
+                                        const company: SavedCompany = {
+                                          id: item.symbol,
+                                          name: item.companyName,
+                                          url: companyUrl,
+                                          exchange: item.exchange,
+                                          symbol: item.symbol
+                                        };
+                                        openCompanyDashboard(company);
+                                      }}
+                                      className="inline-flex items-center gap-1 text-amber-600 hover:text-amber-800 font-medium text-xs bg-amber-50 px-2 py-1 rounded border border-amber-100 transition-colors"
+                                    >
+                                      <Sparkles className="h-3 w-3" />
+                                      Analyze
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        const companyUrl = country === 'IN' 
+                                          ? `https://www.screener.in/company/${item.symbol}/`
+                                          : `https://finance.yahoo.com/quote/${item.symbol}`;
+                                        
+                                        const company: SavedCompany = {
+                                          id: item.symbol,
+                                          name: item.companyName,
+                                          url: companyUrl,
+                                          exchange: item.exchange,
+                                          symbol: item.symbol
+                                        };
+                                        generateSnapshot(company);
+                                      }}
+                                      className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-800 font-medium text-xs bg-indigo-50 px-2 py-1 rounded border border-indigo-100 transition-colors"
+                                    >
+                                      <Activity className="h-3.5 w-3.5" />
+                                      Snapshot
+                                    </button>
+                                  </>
+                                )}
+                                {item.pdfLink ? (
+                                  <a 
+                                    href={item.pdfLink} 
+                                    target="_blank" 
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 font-medium"
+                                  >
+                                    View PDF
+                                    <ExternalLink className="h-4 w-4" />
+                                  </a>
+                                ) : (
+                                  <span className="text-gray-400">No Document</span>
+                                )}
+                              </div>
                             </td>
                           </tr>
                         ))
@@ -1099,6 +1725,58 @@ Use markdown formatting. Make it read like a premium institutional research repo
                       </div>
                     </div>
                   )}
+
+                  {/* Recent Filings Section */}
+                  {companyData.recentAnnouncements && companyData.recentAnnouncements.length > 0 && (
+                    <div>
+                      <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                        <FileText className="h-5 w-5 text-blue-500" />
+                        Recent Exchange Filings & Documents
+                      </h3>
+                      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                        <table className="w-full text-left text-sm text-gray-600">
+                          <thead className="text-xs text-gray-500 uppercase bg-gray-50 border-b border-gray-200">
+                            <tr>
+                              <th className="px-6 py-3 font-medium">Date</th>
+                              <th className="px-6 py-3 font-medium">Subject</th>
+                              <th className="px-6 py-3 font-medium text-right">Document</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-200">
+                            {companyData.recentAnnouncements.map((item: any) => (
+                              <tr key={item.id} className="hover:bg-gray-50 transition-colors">
+                                <td className="px-6 py-3 whitespace-nowrap text-gray-500">
+                                  {item.date ? format(new Date(item.date), 'MMM dd, yyyy') : 'N/A'}
+                                </td>
+                                <td className="px-6 py-3">
+                                  <div className="font-medium text-gray-900 line-clamp-1" title={item.subject}>
+                                    {item.subject}
+                                  </div>
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 mt-1 uppercase">
+                                    {item.category || 'Filing'}
+                                  </span>
+                                </td>
+                                <td className="px-6 py-3 text-right">
+                                  {item.pdfLink ? (
+                                    <a 
+                                      href={item.pdfLink} 
+                                      target="_blank" 
+                                      rel="noopener noreferrer"
+                                      className="text-blue-600 hover:text-blue-800 font-medium inline-flex items-center gap-1"
+                                    >
+                                      View <ExternalLink className="h-3 w-3" />
+                                    </a>
+                                  ) : (
+                                    <span className="text-gray-400">N/A</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="py-12 text-center text-gray-500">
@@ -1110,6 +1788,72 @@ Use markdown formatting. Make it read like a premium institutional research repo
           )}
         </div>
       </main>
+
+      {/* Snapshot Modal */}
+      <AnimatePresence>
+        {showSnapshotModal && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 sm:p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowSnapshotModal(false)}
+              className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-lg bg-white rounded-2xl shadow-2xl overflow-hidden border border-gray-200"
+            >
+              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-6 py-4 flex items-center justify-between">
+                <div className="flex items-center gap-2 text-white">
+                  <Sparkles className="h-5 w-5" />
+                  <h3 className="font-bold">Quick Result Snapshot</h3>
+                </div>
+                <button 
+                  onClick={() => setShowSnapshotModal(false)}
+                  className="text-white/80 hover:text-white transition-colors"
+                >
+                  <RefreshCw className="h-5 w-5 rotate-45" />
+                </button>
+              </div>
+              
+              <div className="p-6">
+                {loadingSnapshot ? (
+                  <div className="py-12 text-center">
+                    <RefreshCw className="h-8 w-8 animate-spin mx-auto text-indigo-600 mb-4" />
+                    <p className="text-gray-500 font-medium">Analyzing latest results...</p>
+                  </div>
+                ) : snapshotData ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-xl font-bold text-gray-900">{snapshotData.name}</h4>
+                      <span className="text-[10px] font-bold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded uppercase">Latest Insight</span>
+                    </div>
+                    <div className="prose prose-sm max-w-none text-gray-700 leading-relaxed">
+                      <Markdown>{snapshotData.snapshot}</Markdown>
+                    </div>
+                    <div className="pt-4 border-t border-gray-100 flex justify-end">
+                      <button 
+                        onClick={() => setShowSnapshotModal(false)}
+                        className="px-4 py-2 bg-gray-900 text-white text-sm font-bold rounded-lg hover:bg-gray-800 transition-colors"
+                      >
+                        Got it
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="py-8 text-center text-gray-500">
+                    <AlertCircle className="h-8 w-8 mx-auto text-red-400 mb-3" />
+                    <p>Failed to generate snapshot. Please try again.</p>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

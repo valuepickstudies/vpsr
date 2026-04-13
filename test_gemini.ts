@@ -2,13 +2,12 @@ import "dotenv/config";
 import { GoogleGenAI } from "@google/genai";
 
 async function testGemini() {
-  console.log("Testing Gemini API Key...");
-  console.log("Key starts with:", process.env.GEMINI_API_KEY?.substring(0, 10));
+  console.log("Testing Gemini API (Managed Key)...");
   
   try {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const ai = new GoogleGenAI({});
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-1.5-flash",
       contents: "Say 'Hello, the API key works!'",
     });
     console.log("Success! Response from Gemini:");

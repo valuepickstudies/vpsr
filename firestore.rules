@@ -1,0 +1,26 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isAuthenticated() && 
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+         request.auth.token.email == "valuepicks25@gmail.com");
+    }
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow write: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+    }
+    match /featureFlags/{key} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /portfolio/{itemId} {
+      allow read: if isAdmin() || (exists(/databases/$(database)/documents/featureFlags/portfolio) && get(/databases/$(database)/documents/featureFlags/portfolio).data.enabled == true);
+      allow write: if isAdmin();
+    }
+  }
+}

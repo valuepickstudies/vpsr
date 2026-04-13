@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["admin", "user"] }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "FeatureFlag": {
+      "title": "FeatureFlag",
+      "description": "Feature flag settings",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["key", "enabled"]
+    },
+    "PortfolioItem": {
+      "title": "PortfolioItem",
+      "description": "Investment portfolio item (SIP or One-time)",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["SIP", "Lumpsum"] },
+        "name": { "type": "string" },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "format": "date-time" },
+        "description": { "type": "string" }
+      },
+      "required": ["type", "name", "amount", "date"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles"
+    },
+    "/featureFlags/{key}": {
+      "schema": "FeatureFlag",
+      "description": "Feature flags"
+    },
+    "/portfolio/{itemId}": {
+      "schema": "PortfolioItem",
+      "description": "Showcase portfolio items"
+    }
+  }
+}
