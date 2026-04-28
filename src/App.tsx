@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { 
   FileText, 
   TrendingUp, 
@@ -25,17 +25,39 @@ import {
   Radar,
   Activity
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
-import { format } from 'date-fns';
+import { format, subDays } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, LabelList } from 'recharts';
-import Markdown from 'react-markdown';
 import html2canvas from 'html2canvas';
 import { marked } from 'marked';
 import { auth, googleProvider, db } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
 import { doc, getDoc, setDoc, onSnapshot, collection, addDoc, deleteDoc } from 'firebase/firestore';
+import { STRATEGY_PORTFOLIOS, type StrategyId } from '../strategyPortfolios';
+import type { CompanyReportData, CompanySnapshotData, QualityGateResult, ReportType } from '../shared/reportTypes';
+import type { SavedReportListItem } from '../shared/savedReportContracts';
+import { fetchJSON } from './services/apiClient';
+import { fetchCompanyReport, fetchCompanySnapshot, fetchOutcomesSummary, fetchReportQuality, fetchReportScoreById, fetchSavedReports, fetchThesisMemory, type OutcomesSummaryData, type ReportScoreData, type ThesisMemoryData } from './services/reportService';
+import { fetchHoldingMetrics, fetchPositionSizing, fetchStrategyPerformance, type PositionSizingData } from './services/portfolioService';
+import { getErrorMessage } from './utils/errorUtils';
+import ScannerWorkspace, { type ScannerStrategy } from './components/ScannerWorkspace';
+import ReportWorkspaceHeader from './components/ReportWorkspaceHeader';
+import ReportFinancialTables from './components/ReportFinancialTables';
+import ReportInsightsPanel from './components/ReportInsightsPanel';
+import ReportChartsSection from './components/ReportChartsSection';
+import FundamentalsPanel from './components/FundamentalsPanel';
+import SnapshotModal from './components/SnapshotModal';
+import {
+  fetchAnnouncementsByType,
+  fetchCompanyFundamentals,
+  fetchPriceHistory,
+  runScannerById,
+  searchCompanies,
+  type Announcement as MarketAnnouncement,
+  type CompanyFundamentals,
+  type CompanySearchResult,
+} from './services/marketDataService';
 
-const STRATEGIES = [
+const STRATEGIES: ScannerStrategy[] = [
   { id: 'VALUE_BUYS', label: 'Deep Value', desc: 'Low P/E, Low P/B, Margin of Safety', icon: <Wallet size={20} className="text-emerald-500" />, bgClass: 'bg-emerald-50', textClass: 'text-emerald-600', premium: false },
   { id: 'QGLP_FRAMEWORK', label: 'QGLP Alpha', desc: 'Raamdeo Agrawal Framework: Quality, Growth, Longevity & Price', icon: <Gem size={20} className="text-rose-500" />, bgClass: 'bg-rose-50', textClass: 'text-rose-600', premium: true },
   { id: 'SMILE_FRAMEWORK', label: 'SMILE Alpha', desc: 'Vijay Kedia: Small cap, Medium experience, Large aspiration, Extra-large potential', icon: <Smile size={20} className="text-violet-500" />, bgClass: 'bg-violet-50', textClass: 'text-violet-600', premium: true },
@@ -47,16 +69,7 @@ const STRATEGIES = [
   { id: 'GARP', label: 'GARP', desc: 'Growth at Reasonable Price (PEG < 1)', icon: <TrendingUp size={20} className="text-cyan-500" />, bgClass: 'bg-cyan-50', textClass: 'text-cyan-600', premium: true },
 ];
 
-type Announcement = {
-  id: string;
-  symbol: string;
-  companyName: string;
-  subject: string;
-  date: string;
-  pdfLink: string | null;
-  exchange: string;
-  category: string;
-};
+type Announcement = MarketAnnouncement;
 
 type SavedCompany = {
   id: string;
@@ -66,6 +79,45 @@ type SavedCompany = {
   symbol: string;
 };
 
+const SELECTED_COMPANY_STORAGE_KEY = 'selectedCompanyContext';
+function loadSelectedCompanyContext(): {
+  company: SavedCompany | null;
+  country: 'IN' | 'US';
+  activeTab: 'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio';
+} {
+  try {
+    const raw = localStorage.getItem(SELECTED_COMPANY_STORAGE_KEY);
+    if (!raw) return { company: null, country: 'IN', activeTab: 'discover' };
+    const parsed = JSON.parse(raw);
+    const company = parsed?.company;
+    const country: 'IN' | 'US' = parsed?.country === 'US' ? 'US' : 'IN';
+    if (!company?.url || !company?.id) return { company: null, country, activeTab: 'discover' };
+    return { company, country, activeTab: 'discover' };
+  } catch {
+    return { company: null, country: 'IN', activeTab: 'discover' };
+  }
+}
+
+function redactCompanyNameFromText(input: string, companyName: string, symbol?: string, replacement = '[Hidden Company]'): string {
+  if (!input) return input;
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const legalSuffixes = new Set(['ltd', 'limited', 'inc', 'corp', 'corporation', 'co', 'company', 'plc', 'llc', 'pvt', 'private']);
+  const words = companyName.trim().match(/[A-Za-z0-9]+/g) || [];
+  const coreWords = [...words];
+  while (coreWords.length > 0 && legalSuffixes.has(coreWords[coreWords.length - 1].toLowerCase())) {
+    coreWords.pop();
+  }
+  const patterns: RegExp[] = [];
+  if (companyName.trim()) patterns.push(new RegExp(escapeRegex(companyName.trim()), 'gi'));
+  if (words.length) patterns.push(new RegExp(`\\b${words.map(escapeRegex).join('\\s+')}\\b`, 'gi'));
+  if (coreWords.length && coreWords.length !== words.length) patterns.push(new RegExp(`\\b${coreWords.map(escapeRegex).join('\\s+')}\\b`, 'gi'));
+  if (coreWords.length >= 2) patterns.push(new RegExp(`\\b${escapeRegex(coreWords[0])}\\s+${escapeRegex(coreWords[1])}\\b`, 'gi'));
+  if (symbol && symbol.length >= 2 && symbol.length <= 10) patterns.push(new RegExp(`\\b${escapeRegex(symbol)}\\b`, 'gi'));
+  let output = input;
+  for (const p of patterns) output = output.replace(p, replacement);
+  return output;
+}
+
 type PortfolioItem = {
   id: string;
   type: 'SIP' | 'Lumpsum';
@@ -74,6 +126,138 @@ type PortfolioItem = {
   date: string;
   description?: string;
 };
+
+type CustomPortfolioHolding = {
+  symbol: string;
+  name: string;
+  purchaseDate: string;
+  amount: number;
+  quantity: number;
+};
+
+type CustomPortfolio = {
+  id: string;
+  name: string;
+  holdings: CustomPortfolioHolding[];
+};
+
+type StrategyPerfRow = {
+  symbol: string;
+  returnPct: number | null;
+};
+
+type StrategyPerformance = {
+  equalWeightReturnPct: number | null;
+  countOk: number;
+  countTotal: number;
+  symbols: StrategyPerfRow[];
+};
+
+type HoldingMetrics = {
+  symbol: string;
+  purchaseDate: string;
+  purchasePrice: number;
+  currentDate: string;
+  currentPrice: number;
+  quantity: number | null;
+  investmentValue: number | null;
+  marketValue: number | null;
+  dailyPctGain: number | null;
+  totalPctGain: number | null;
+};
+
+function getApiErrorMessage(response: { success: boolean; error?: string }, fallback: string): string {
+  if (!response.success && response.error) return response.error;
+  return fallback;
+}
+
+type TechnicalRange = '3M' | '6M' | '1Y' | '3Y' | '5Y';
+type TechnicalCandle = {
+  date: string;
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+};
+
+type PriceActionMarker = {
+  ts: number;
+  price: number;
+  label: string;
+  kind: 'breakout' | 'breakdown' | 'swing-high' | 'swing-low';
+};
+
+function clampNumber(v: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, v));
+}
+
+function filterCandlesByRange(candles: TechnicalCandle[], range: TechnicalRange): TechnicalCandle[] {
+  if (!candles.length) return [];
+  const days =
+    range === '3M' ? 90 :
+    range === '6M' ? 180 :
+    range === '1Y' ? 365 :
+    range === '3Y' ? 365 * 3 :
+    365 * 5;
+  const cutoff = subDays(new Date(candles[candles.length - 1].ts), days).getTime();
+  return candles.filter((c) => c.ts >= cutoff);
+}
+
+function buildPriceActionMarkers(candles: TechnicalCandle[]): PriceActionMarker[] {
+  if (candles.length < 30) return [];
+  const out: PriceActionMarker[] = [];
+  const breakoutWindow = 20;
+  const swingWindow = 3;
+
+  for (let i = breakoutWindow; i < candles.length; i++) {
+    const prev = candles.slice(i - breakoutWindow, i);
+    const prevHigh = Math.max(...prev.map((c) => c.high));
+    const prevLow = Math.min(...prev.map((c) => c.low));
+    const c = candles[i];
+    if (c.close > prevHigh * 1.01) out.push({ ts: c.ts, price: c.high, label: 'Breakout', kind: 'breakout' });
+    else if (c.close < prevLow * 0.99) out.push({ ts: c.ts, price: c.low, label: 'Breakdown', kind: 'breakdown' });
+  }
+
+  for (let i = swingWindow; i < candles.length - swingWindow; i++) {
+    const c = candles[i];
+    const left = candles.slice(i - swingWindow, i);
+    const right = candles.slice(i + 1, i + swingWindow + 1);
+    if ([...left, ...right].every((p) => c.high >= p.high)) out.push({ ts: c.ts, price: c.high, label: 'Swing High', kind: 'swing-high' });
+    if ([...left, ...right].every((p) => c.low <= p.low)) out.push({ ts: c.ts, price: c.low, label: 'Swing Low', kind: 'swing-low' });
+  }
+
+  out.sort((a, b) => a.ts - b.ts);
+  return out.slice(-20);
+}
+
+function buildFutureProjectionRows(chartData: Array<{ year: string; sales: number; netProfit: number }>) {
+  const rows = (chartData || []).slice(-4).map((r) => ({
+    year: String(r.year),
+    sales: Number(r.sales) || 0,
+    netProfit: Number(r.netProfit) || 0,
+  })).filter((r) => Number.isFinite(r.sales) && Number.isFinite(r.netProfit));
+  if (rows.length < 2) return [];
+  const salesGrowth = rows.slice(1).map((r, i) => rows[i].sales > 0 ? (r.sales / rows[i].sales - 1) : 0);
+  const profitGrowth = rows.slice(1).map((r, i) => rows[i].netProfit > 0 ? (r.netProfit / rows[i].netProfit - 1) : 0);
+  const avgSalesGrowth = salesGrowth.length ? salesGrowth.reduce((a, b) => a + b, 0) / salesGrowth.length : 0;
+  const avgProfitGrowth = profitGrowth.length ? profitGrowth.reduce((a, b) => a + b, 0) / profitGrowth.length : 0;
+  const last = rows[rows.length - 1];
+  let s = last.sales;
+  let p = last.netProfit;
+  const out = [];
+  for (let i = 1; i <= 3; i++) {
+    s = s * (1 + clampNumber(avgSalesGrowth, -0.2, 0.35));
+    p = p * (1 + clampNumber(avgProfitGrowth, -0.3, 0.4));
+    out.push({
+      year: `${Number(last.year || new Date().getFullYear()) + i}E`,
+      sales: Number(s.toFixed(2)),
+      netProfit: Number(p.toFixed(2)),
+    });
+  }
+  return out;
+}
 
 enum OperationType {
   CREATE = 'create',
@@ -127,28 +311,34 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio'>('discover');
+  const [activeTab, setActiveTab] = useState<'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio'>(() => loadSelectedCompanyContext().activeTab);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
   const [searchQuery, setSearchQuery] = useState('');
-  const [companies, setCompanies] = useState<any[]>([]);
+  const [companies, setCompanies] = useState<CompanySearchResult[]>([]);
   const [searchingCompanies, setSearchingCompanies] = useState(false);
 
   // Dashboard State
-  const [selectedCompany, setSelectedCompany] = useState<SavedCompany | null>(null);
-  const [companyData, setCompanyData] = useState<any>(null);
+  const [selectedCompany, setSelectedCompany] = useState<SavedCompany | null>(() => loadSelectedCompanyContext().company);
+  const [companyData, setCompanyData] = useState<CompanyFundamentals | null>(null);
   const [loadingCompany, setLoadingCompany] = useState(false);
 
   // Report State
-  const [reportData, setReportData] = useState<any>(null);
+  const [reportData, setReportData] = useState<CompanyReportData | null>(null);
   const [loadingReport, setLoadingReport] = useState(false);
   const [showReport, setShowReport] = useState(false);
+  const [reportType, setReportType] = useState<ReportType>('standard');
+  const [hideCompanyNameInReport, setHideCompanyNameInReport] = useState(false);
+  const [reportCompanyNameRevealed, setReportCompanyNameRevealed] = useState(false);
+  const [technicalRange, setTechnicalRange] = useState<TechnicalRange>('1Y');
+  const [priceCandles, setPriceCandles] = useState<TechnicalCandle[]>([]);
+  const [loadingPriceCandles, setLoadingPriceCandles] = useState(false);
   const chartsRef = useRef<HTMLDivElement>(null);
 
   // Snapshot State
-  const [snapshotData, setSnapshotData] = useState<{ name: string; snapshot: string } | null>(null);
+  const [snapshotData, setSnapshotData] = useState<CompanySnapshotData | null>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState(false);
   const [showSnapshotModal, setShowSnapshotModal] = useState(false);
 
@@ -160,10 +350,11 @@ export default function App() {
 
   // Scanner State
   const [selectedScanner, setSelectedScanner] = useState<string | null>(null);
-  const [scannerResults, setScannerResults] = useState<any[]>([]);
+  const [scannerResults, setScannerResults] = useState<CompanySearchResult[]>([]);
   const [loadingScanner, setLoadingScanner] = useState(false);
+  const [scannerWorkspaceTab, setScannerWorkspaceTab] = useState<'scanners' | 'results' | 'reports'>('scanners');
   const [isPaidCustomer, setIsPaidCustomer] = useState(false);
-  const [country, setCountry] = useState<'IN' | 'US'>('IN');
+  const [country, setCountry] = useState<'IN' | 'US'>(() => loadSelectedCompanyContext().country);
 
   // Feature Flags
   const [visiblePages, setVisiblePages] = useState({
@@ -184,21 +375,66 @@ export default function App() {
     description: '',
   });
   const [portfolioSearchQuery, setPortfolioSearchQuery] = useState('');
-  const [portfolioSearchResults, setPortfolioSearchResults] = useState<any[]>([]);
+  const [portfolioSearchResults, setPortfolioSearchResults] = useState<CompanySearchResult[]>([]);
   const [isSearchingPortfolio, setIsSearchingPortfolio] = useState(false);
   const [showPortfolioResults, setShowPortfolioResults] = useState(false);
+  const [portfolioWorkspaceTab, setPortfolioWorkspaceTab] = useState<'strategy' | 'custom'>('strategy');
+  const [strategyTab, setStrategyTab] = useState<StrategyId>('medium_risk');
+  const [strategyInvestDate, setStrategyInvestDate] = useState(() => format(subDays(new Date(), 365 * 3), 'yyyy-MM-dd'));
+  const [strategyPerf, setStrategyPerf] = useState<StrategyPerformance | null>(null);
+  const [strategyPerfLoading, setStrategyPerfLoading] = useState(false);
+  const [strategyPerfError, setStrategyPerfError] = useState<string | null>(null);
+  const [strategyWeightMode, setStrategyWeightMode] = useState<'equal' | 'best'>('equal');
+  const [strategyInvestmentAmount, setStrategyInvestmentAmount] = useState(100000);
+  const [savedReports, setSavedReports] = useState<SavedReportListItem[]>([]);
+  const [loadingSavedReports, setLoadingSavedReports] = useState(false);
+  const [judgeData, setJudgeData] = useState<QualityGateResult | null>(null);
+  const [loadingJudge, setLoadingJudge] = useState(false);
+  const [recencyValidation, setRecencyValidation] = useState<{ latestAnnouncementDate: string | null; checkedAt: string; symbol: string } | null>(null);
+  const [reportScore, setReportScore] = useState<ReportScoreData["scorecard"] | null>(null);
+  const [outcomesSummary, setOutcomesSummary] = useState<OutcomesSummaryData | null>(null);
+  const [loadingScoreAndOutcomes, setLoadingScoreAndOutcomes] = useState(false);
+  const [thesisMemory, setThesisMemory] = useState<ThesisMemoryData | null>(null);
+  const [positionSizing, setPositionSizing] = useState<PositionSizingData | null>(null);
+  const [customPortfolios, setCustomPortfolios] = useState<CustomPortfolio[]>(() => {
+    try {
+      const raw = localStorage.getItem('customPortfolios');
+      return raw ? JSON.parse(raw) : [{ id: 'default', name: 'My Portfolio', holdings: [] }];
+    } catch {
+      return [{ id: 'default', name: 'My Portfolio', holdings: [] }];
+    }
+  });
+  const [activeCustomPortfolioId, setActiveCustomPortfolioId] = useState<string>('default');
+  const [showPortfolioView, setShowPortfolioView] = useState(false);
+  const [holdingMetrics, setHoldingMetrics] = useState<Record<string, HoldingMetrics | null>>({});
+  const [chartPaletteByCountry, setChartPaletteByCountry] = useState<Record<'IN' | 'US', 'default' | 'emerald' | 'violet'>>(() => {
+    try {
+      const raw = localStorage.getItem('chartPaletteByCountry');
+      if (!raw) return { IN: 'default', US: 'default' };
+      const parsed = JSON.parse(raw);
+      return {
+        IN: parsed?.IN || 'default',
+        US: parsed?.US || 'default',
+      };
+    } catch {
+      return { IN: 'default', US: 'default' };
+    }
+  });
 
   // Auth State
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isLocalAdminAuthenticated, setIsLocalAdminAuthenticated] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const hasAdminAccess = isAdmin || isLocalAdminAuthenticated;
 
   useEffect(() => {
     // Listen for feature flags
     const unsubFlags = onSnapshot(collection(db, 'featureFlags'), (snapshot) => {
-      const updates: any = {};
+      const updates: Partial<typeof visiblePages> = {};
       snapshot.forEach((doc) => {
-        updates[doc.id] = doc.data().enabled;
+        const key = doc.id as keyof typeof visiblePages;
+        updates[key] = Boolean(doc.data().enabled);
       });
       setVisiblePages(prev => ({ ...prev, ...updates }));
     }, (error) => {
@@ -243,7 +479,7 @@ export default function App() {
   }, []);
 
   const togglePageVisibility = async (page: string, isVisible: boolean) => {
-    if (!isAdmin) return;
+    if (!hasAdminAccess) return;
     try {
       await setDoc(doc(db, 'featureFlags', page), { enabled: !isVisible });
     } catch (error) {
@@ -252,7 +488,7 @@ export default function App() {
   };
 
   const addPortfolioItem = async () => {
-    if (!isAdmin) return;
+    if (!hasAdminAccess) return;
     try {
       await addDoc(collection(db, 'portfolio'), portfolioForm);
       setPortfolioForm({
@@ -269,7 +505,7 @@ export default function App() {
   };
 
   const deletePortfolioItem = async (id: string) => {
-    if (!isAdmin) return;
+    if (!hasAdminAccess) return;
     try {
       await deleteDoc(doc(db, 'portfolio', id));
     } catch (error) {
@@ -282,11 +518,14 @@ export default function App() {
     setIsLoggingIn(true);
     try {
       await signInWithPopup(auth, googleProvider);
-    } catch (err: any) {
-      if (err.code === 'auth/popup-blocked') {
+    } catch (err: unknown) {
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code || '') : '';
+      if (code === 'auth/popup-blocked') {
         alert("Please enable popups for this site to log in.");
-      } else if (err.code === 'auth/cancelled-popup-request') {
+      } else if (code === 'auth/cancelled-popup-request') {
         console.log("Popup request cancelled by user or another request.");
+      } else if (code === 'auth/api-key-not-valid.-please-pass-a-valid-api-key.') {
+        alert("Firebase API key is invalid. Set VITE_FIREBASE_API_KEY in .env.local and restart the dev server.");
       } else {
         console.error("Login failed:", err);
       }
@@ -296,7 +535,13 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    if (isLocalAdminAuthenticated && !user) {
+      setIsLocalAdminAuthenticated(false);
+      setIsAdmin(false);
+      return;
+    }
     await signOut(auth);
+    setIsLocalAdminAuthenticated(false);
     window.location.reload();
   };
 
@@ -305,16 +550,32 @@ export default function App() {
   }, [savedCompanies]);
 
   useEffect(() => {
+    localStorage.setItem('customPortfolios', JSON.stringify(customPortfolios));
+  }, [customPortfolios]);
+
+  useEffect(() => {
+    localStorage.setItem('chartPaletteByCountry', JSON.stringify(chartPaletteByCountry));
+  }, [chartPaletteByCountry]);
+
+  useEffect(() => {
+    if (selectedCompany) {
+      localStorage.setItem(SELECTED_COMPANY_STORAGE_KEY, JSON.stringify({ company: selectedCompany, country }));
+    } else {
+      localStorage.removeItem(SELECTED_COMPANY_STORAGE_KEY);
+    }
+  }, [selectedCompany, country]);
+
+  useEffect(() => {
     const searchPortfolioCompanies = async () => {
       if (portfolioSearchQuery.length >= 3) {
         setIsSearchingPortfolio(true);
         try {
-          const json = await fetchJSON(`/api/companies?search=${encodeURIComponent(portfolioSearchQuery)}&country=${country}`);
+          const json = await searchCompanies(portfolioSearchQuery, country);
           if (json.success) {
             setPortfolioSearchResults(json.data);
             setShowPortfolioResults(true);
           }
-        } catch (err) {
+        } catch (err: unknown) {
           console.error("Portfolio search failed", err);
         } finally {
           setIsSearchingPortfolio(false);
@@ -329,72 +590,230 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [portfolioSearchQuery, country]);
 
-  const fetchJSON = async (url: string, options?: RequestInit, retryCount = 0): Promise<any> => {
+  const loadStrategyPerformance = useCallback(async (overrideDate?: string) => {
+    const pf = STRATEGY_PORTFOLIOS.find((p) => p.id === strategyTab);
+    if (!pf) return;
+    const investDate = overrideDate ?? strategyInvestDate;
+    setStrategyPerfLoading(true);
+    setStrategyPerfError(null);
     try {
-      const res = await fetch(url, options);
-      const contentType = res.headers.get("content-type");
-      
-      if (!res.ok) {
-        let errorMessage = `Server error: ${res.status} ${res.statusText}`;
-        if (contentType && contentType.includes("application/json")) {
-          try {
-            const errorJson = await res.json();
-            errorMessage = errorJson.error || errorMessage;
-          } catch (e) {
-            // Fallback to default message
-          }
-        } else {
-          const text = await res.text();
-          console.error(`Non-JSON error response from ${url}:`, text.substring(0, 200));
-          
-          // If we get "Starting Server" HTML, it's a transient state
-          if (text.includes("<title>Starting Server...</title>") && retryCount < 1) {
-            console.log(`Server still starting, retrying ${url} in 2s...`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return fetchJSON(url, options, retryCount + 1);
-          }
-        }
-        throw new Error(errorMessage);
-      }
-
-      if (!contentType || !contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error(`Expected JSON but got ${contentType} from ${url}:`, text.substring(0, 200));
-        
-        // Retry for HTML responses that might be transient
-        if (text.includes("<!doctype html>") && retryCount < 1) {
-          console.log(`Received HTML instead of JSON, retrying ${url} in 2s...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          return fetchJSON(url, options, retryCount + 1);
-        }
-        
-        throw new Error("Invalid response format from server. Please try again.");
-      }
-
-      return res.json();
-    } catch (err: any) {
-      if (retryCount < 1 && err.message === "Failed to fetch") {
-        // Network errors also worth a single retry
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return fetchJSON(url, options, retryCount + 1);
-      }
-      throw err;
+      const symbols = pf.stocks.map((s) => s.symbol).join(',');
+      const json = await fetchStrategyPerformance(investDate, symbols);
+      if (!json.success) throw new Error(getApiErrorMessage(json, 'Performance request failed'));
+      setStrategyPerf(json.data);
+    } catch (err: unknown) {
+      setStrategyPerf(null);
+      setStrategyPerfError(getErrorMessage(err, 'Failed to load performance'));
+    } finally {
+      setStrategyPerfLoading(false);
     }
+  }, [strategyTab, strategyInvestDate]);
+
+  useEffect(() => {
+    if (activeTab !== 'portfolio') return;
+    void loadStrategyPerformance();
+  }, [activeTab, strategyTab, loadStrategyPerformance]);
+
+  const selectedStrategyPf = useMemo(
+    () => STRATEGY_PORTFOLIOS.find((p) => p.id === strategyTab),
+    [strategyTab]
+  );
+
+  const activeCustomPortfolio = useMemo(
+    () => customPortfolios.find((p) => p.id === activeCustomPortfolioId) || customPortfolios[0] || { id: 'default', name: 'My Portfolio', holdings: [] },
+    [customPortfolios, activeCustomPortfolioId]
+  );
+
+  const addToCustomPortfolio = (company: { symbol?: string; id?: string; name: string }) => {
+    const symbol = (company.symbol || company.id || '').toUpperCase();
+    if (!symbol) return;
+    const today = format(new Date(), 'yyyy-MM-dd');
+    setCustomPortfolios((prev) => prev.map((p) => {
+      if (p.id !== activeCustomPortfolio.id) return p;
+      if (p.holdings.some((h) => h.symbol === symbol)) return p;
+      return {
+        ...p,
+        holdings: [
+          ...p.holdings,
+          { symbol, name: company.name, purchaseDate: today, amount: 10000, quantity: 1 },
+        ],
+      };
+    }));
   };
+
+  const removeHolding = (symbol: string) => {
+    setCustomPortfolios((prev) => prev.map((p) => (
+      p.id === activeCustomPortfolio.id
+        ? { ...p, holdings: p.holdings.filter((h) => h.symbol !== symbol) }
+        : p
+    )));
+  };
+
+  const updateHolding = (symbol: string, patch: Partial<CustomPortfolioHolding>) => {
+    setCustomPortfolios((prev) => prev.map((p) => (
+      p.id === activeCustomPortfolio.id
+        ? {
+            ...p,
+            holdings: p.holdings.map((h) => h.symbol === symbol ? { ...h, ...patch } : h),
+          }
+        : p
+    )));
+  };
+
+  const loadSavedReports = useCallback(async () => {
+    if (!selectedCompany) return;
+    setLoadingSavedReports(true);
+    try {
+      const json = await fetchSavedReports(country, selectedCompany.symbol || selectedCompany.id);
+      if (json.success) setSavedReports(json.data || []);
+    } catch (err: unknown) {
+      console.warn('Failed to load saved reports', err);
+    } finally {
+      setLoadingSavedReports(false);
+    }
+  }, [country, selectedCompany]);
+
+  const loadScoreAndOutcomes = useCallback(async () => {
+    if (!selectedCompany) return;
+    setLoadingScoreAndOutcomes(true);
+    try {
+      const saved = await fetchSavedReports(country, selectedCompany.symbol || selectedCompany.id);
+      const latestReport = saved.success && saved.data.length > 0 ? saved.data[0] : null;
+      if (latestReport) {
+        const score = await fetchReportScoreById(Number(latestReport.id));
+        if (score.success) {
+          setReportScore(score.data.scorecard);
+          const sizing = await fetchPositionSizing({
+            capital: strategyInvestmentAmount || 100000,
+            riskBudgetPct: 1,
+            stopLossPct: 8,
+            candidates: [{ symbol: selectedCompany.symbol || selectedCompany.id, score: score.data.scorecard.totalScore }],
+          });
+          if (sizing.success) setPositionSizing(sizing.data);
+          else setPositionSizing(null);
+        }
+      } else {
+        setReportScore(null);
+        setPositionSizing(null);
+      }
+      const outcomes = await fetchOutcomesSummary(90, country);
+      if (outcomes.success) setOutcomesSummary(outcomes.data);
+      else setOutcomesSummary(null);
+      const thesis = await fetchThesisMemory((selectedCompany.symbol || selectedCompany.id).toUpperCase(), country);
+      if (thesis.success) setThesisMemory(thesis.data);
+      else setThesisMemory(null);
+    } catch (err: unknown) {
+      console.warn("Failed to load score/outcomes", err);
+      setReportScore(null);
+      setOutcomesSummary(null);
+      setThesisMemory(null);
+      setPositionSizing(null);
+    } finally {
+      setLoadingScoreAndOutcomes(false);
+    }
+  }, [country, selectedCompany, strategyInvestmentAmount]);
+
+  const runJudgeValidation = useCallback(async () => {
+    if (!selectedCompany) return;
+    setLoadingJudge(true);
+    try {
+      const { judge, recency } = await fetchReportQuality(selectedCompany.url, country, selectedCompany.symbol);
+      if (judge?.success) setJudgeData(judge.data as QualityGateResult);
+      if (recency?.success) setRecencyValidation(recency.data as { latestAnnouncementDate: string | null; checkedAt: string; symbol: string });
+    } catch (err: unknown) {
+      console.warn('Judge validation failed', err);
+      setJudgeData(null);
+      setRecencyValidation(null);
+    } finally {
+      setLoadingJudge(false);
+    }
+  }, [country, selectedCompany]);
+
+  useEffect(() => {
+    if (!selectedCompany || !showReport) {
+      setPriceCandles([]);
+      setLoadingPriceCandles(false);
+      return;
+    }
+    let cancelled = false;
+    setTechnicalRange('1Y');
+    setLoadingPriceCandles(true);
+
+    (async () => {
+      try {
+        const json = await fetchPriceHistory(selectedCompany.url, country, selectedCompany.symbol);
+        if (!cancelled && json?.success) {
+          setPriceCandles(json.data.candles);
+        }
+      } catch (err: unknown) {
+        console.warn('Failed to load price candles', err);
+        if (!cancelled) setPriceCandles([]);
+      } finally {
+        if (!cancelled) setLoadingPriceCandles(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCompany?.url, selectedCompany?.symbol, country, showReport]);
+
+  useEffect(() => {
+    if (!selectedCompany || !showReport || !reportData) return;
+    void loadSavedReports();
+    void runJudgeValidation();
+    void loadScoreAndOutcomes();
+  }, [selectedCompany, showReport, reportData, loadSavedReports, runJudgeValidation, loadScoreAndOutcomes]);
+
+  useEffect(() => {
+    if (!showPortfolioView || portfolioWorkspaceTab !== 'custom') return;
+    (async () => {
+      const next: Record<string, HoldingMetrics | null> = {};
+      for (const h of activeCustomPortfolio.holdings) {
+        try {
+          const json = await fetchHoldingMetrics(h.symbol, h.purchaseDate, h.quantity);
+          if (json.success) next[h.symbol] = json.data;
+        } catch {
+          next[h.symbol] = null;
+        }
+      }
+      setHoldingMetrics(next);
+    })();
+  }, [showPortfolioView, portfolioWorkspaceTab, activeCustomPortfolio, fetchJSON]);
+
+  const rangedCandles = useMemo(
+    () => filterCandlesByRange(priceCandles, technicalRange),
+    [priceCandles, technicalRange]
+  );
+  const priceActionMarkers = useMemo(
+    () => buildPriceActionMarkers(rangedCandles),
+    [rangedCandles]
+  );
+  const projectionRows = useMemo(
+    () => buildFutureProjectionRows(reportData?.chartData || []),
+    [reportData?.chartData]
+  );
+  const activeChartPalette = useMemo(() => {
+    const mode = chartPaletteByCountry[country];
+    if (mode === 'emerald') return { sales: '#059669', profit: '#0ea5e9', eps: '#f59e0b', projection: '#10b981', technical: '#2563eb' };
+    if (mode === 'violet') return { sales: '#7c3aed', profit: '#ec4899', eps: '#f59e0b', projection: '#8b5cf6', technical: '#0891b2' };
+    return { sales: '#3B82F6', profit: '#10B981', eps: '#F59E0B', projection: '#6366F1', technical: '#2563eb' };
+  }, [chartPaletteByCountry, country]);
 
   const runScanner = async (id: string) => {
     setSelectedScanner(id);
+    setScannerWorkspaceTab('results');
     setLoadingScanner(true);
     try {
-      const json = await fetchJSON(`/api/scanners/${id}?country=${country}`);
+      const json = await runScannerById(id, country);
       if (json.success) {
         setScannerResults(json.data);
       } else {
         setScannerResults([]);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to run scanner", err);
-      setError(err.message || "Failed to run scanner");
+      setError(getErrorMessage(err, "Failed to run scanner"));
       setScannerResults([]);
     } finally {
       setLoadingScanner(false);
@@ -405,14 +824,14 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const json = await fetchJSON(`/api/announcements?type=${type}&country=${country}`);
+      const json = await fetchAnnouncementsByType(type, country);
       if (json.success) {
         setAnnouncements(json.data);
       } else {
-        setError(json.error || 'Failed to fetch data');
+        setError(getApiErrorMessage(json, 'Failed to fetch data'));
       }
-    } catch (err: any) {
-      setError(err.message || 'Network error');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Network error'));
     } finally {
       setLoading(false);
     }
@@ -422,13 +841,13 @@ export default function App() {
     if (e.key === 'Enter' && searchQuery.trim()) {
       setSearchingCompanies(true);
       try {
-        const json = await fetchJSON(`/api/companies?search=${encodeURIComponent(searchQuery)}&country=${country}`);
+        const json = await searchCompanies(searchQuery, country);
         if (json.success) {
           setCompanies(json.data);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Failed to search companies", err);
-        setError(err.message || "Failed to search companies");
+        setError(getErrorMessage(err, "Failed to search companies"));
       } finally {
         setSearchingCompanies(false);
       }
@@ -436,6 +855,9 @@ export default function App() {
   };
 
   const openCompanyDashboard = async (company: SavedCompany) => {
+    if (activeTab === 'scanners') {
+      setScannerWorkspaceTab('reports');
+    }
     setSelectedCompany(company);
     setLoadingCompany(true);
     setCompanyData(null);
@@ -443,15 +865,15 @@ export default function App() {
     setReportData(null);
     setError(null);
     try {
-      const json = await fetchJSON(`/api/company/fundamentals?url=${encodeURIComponent(company.url)}&country=${country}`);
+      const json = await fetchCompanyFundamentals(company.url, country);
       if (json.success) {
         setCompanyData(json.data);
       } else {
-        throw new Error(json.error || "Failed to fetch company data");
+        throw new Error(getApiErrorMessage(json, "Failed to fetch company data"));
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to fetch fundamentals:", err);
-      setError(err.message || "Failed to fetch company fundamentals");
+      setError(getErrorMessage(err, "Failed to fetch company fundamentals"));
     } finally {
       setLoadingCompany(false);
     }
@@ -461,17 +883,19 @@ export default function App() {
     if (!selectedCompany) return;
     setLoadingReport(true);
     setShowReport(true);
+    setReportCompanyNameRevealed(false);
     setError(null);
     try {
-      const json = await fetchJSON(`/api/company/report?url=${encodeURIComponent(selectedCompany.url)}&country=${country}`);
+      const json = await fetchCompanyReport(selectedCompany.url, country, reportType);
       if (json.success) {
-        setReportData(json.data);
+        setReportData(json.data.data);
+        if (json.data.qualityGate) setJudgeData(json.data.qualityGate as QualityGateResult);
       } else {
-        throw new Error(json.error || "Failed to fetch report data from server");
+        throw new Error(getApiErrorMessage(json, "Failed to fetch report data from server"));
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to generate report:", err);
-      setError(err.message || "Failed to generate report");
+      setError(getErrorMessage(err, "Failed to generate report"));
     } finally {
       setLoadingReport(false);
     }
@@ -482,15 +906,15 @@ export default function App() {
     setShowSnapshotModal(true);
     setSnapshotData(null);
     try {
-      const json = await fetchJSON(`/api/company/snapshot?url=${encodeURIComponent(company.url)}&country=${country}`);
+      const json = await fetchCompanySnapshot(company.url, country);
       if (json.success) {
         setSnapshotData(json.data);
       } else {
-        throw new Error(json.error || "Failed to generate snapshot");
+        throw new Error(getApiErrorMessage(json, "Failed to generate snapshot"));
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to generate snapshot:", err);
-      setSnapshotData({ name: company.name, snapshot: `Error: ${err.message}` });
+      setSnapshotData({ name: company.name, snapshot: `Error: ${getErrorMessage(err, "Failed to generate snapshot")}` });
     } finally {
       setLoadingSnapshot(false);
     }
@@ -506,7 +930,7 @@ export default function App() {
         const imgData = canvas.toDataURL('image/png');
         chartsMd = `\n\n## Financial Charts\n\n![Financial Charts](${imgData})\n\n`;
         chartsHtml = `<h2>Financial Charts</h2><img src="${imgData}" alt="Financial Charts" style="max-width:100%;height:auto;border-radius:8px;box-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1);" />`;
-      } catch (err) {
+      } catch (err: unknown) {
         console.error("Failed to capture charts", err);
       }
     }
@@ -515,7 +939,7 @@ export default function App() {
     let tablesHtml = '<h2>Raw Financial Data</h2><h3>Historical Results (Annual)</h3><table border="1" style="border-collapse: collapse; width: 100%; margin-bottom: 20px;"><tr><th>Year</th><th>Sales (Cr)</th><th>Net Profit (Cr)</th><th>EPS (Rs)</th></tr>';
 
     if (reportData?.chartData) {
-      reportData.chartData.forEach((row: any) => {
+      reportData.chartData.forEach((row) => {
         tablesMd += `| ${row.year} | ${row.sales} | ${row.netProfit} | ${row.eps} |\n`;
         tablesHtml += `<tr><td>${row.year}</td><td>${row.sales}</td><td>${row.netProfit}</td><td>${row.eps}</td></tr>`;
       });
@@ -526,7 +950,7 @@ export default function App() {
     tablesHtml += '<h3>Latest Results (Quarterly)</h3><table border="1" style="border-collapse: collapse; width: 100%;"><tr><th>Quarter</th><th>Sales (Cr)</th><th>Net Profit (Cr)</th><th>EPS (Rs)</th></tr>';
 
     if (reportData?.quarterlyData) {
-      reportData.quarterlyData.slice(-6).forEach((row: any) => {
+      reportData.quarterlyData.slice(-6).forEach((row) => {
         tablesMd += `| ${row.quarter} | ${row.sales} | ${row.netProfit} | ${row.eps} |\n`;
         tablesHtml += `<tr><td>${row.quarter}</td><td>${row.sales}</td><td>${row.netProfit}</td><td>${row.eps}</td></tr>`;
       });
@@ -536,29 +960,46 @@ export default function App() {
     return { chartsMd, chartsHtml, tablesMd, tablesHtml };
   };
 
+  const shouldHideCompanyNameInReport = Boolean(selectedCompany && hideCompanyNameInReport && !reportCompanyNameRevealed);
+  const reportCompanyTitle = shouldHideCompanyNameInReport ? 'Hidden Company' : (selectedCompany?.name || 'Company');
+  const aiReportMarkdown = useMemo(() => {
+    const raw = String(reportData?.aiReport || '');
+    if (!raw) return raw;
+    if (!shouldHideCompanyNameInReport || !selectedCompany?.name) return raw;
+    return redactCompanyNameFromText(raw, selectedCompany.name, selectedCompany.symbol);
+  }, [reportData?.aiReport, selectedCompany?.name, selectedCompany?.symbol, shouldHideCompanyNameInReport]);
+
   const downloadMarkdown = async () => {
     if (!reportData || !selectedCompany) return;
+    if (judgeData && !judgeData.passed) {
+      alert(`Export blocked: report quality gate failed (${judgeData.completenessScore}%). Missing: ${judgeData.missingComponents.join(', ')}`);
+      return;
+    }
     const { chartsMd, tablesMd } = await generateReportContent();
-    const content = `# ${selectedCompany.name} - Financial Report\n\n` + reportData.aiReport + chartsMd + tablesMd;
+    const content = `# ${reportCompanyTitle} - Financial Report\n\n` + aiReportMarkdown + chartsMd + tablesMd;
     const blob = new Blob([content], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${selectedCompany.name.replace(/\s+/g, '_')}_Report.md`;
+    a.download = `${reportCompanyTitle.replace(/\s+/g, '_')}_Report.md`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
   const downloadHTML = async () => {
     if (!reportData || !selectedCompany) return;
+    if (judgeData && !judgeData.passed) {
+      alert(`Export blocked: report quality gate failed (${judgeData.completenessScore}%). Missing: ${judgeData.missingComponents.join(', ')}`);
+      return;
+    }
     const { chartsHtml, tablesHtml } = await generateReportContent();
-    const mdHtml = await marked.parse(reportData.aiReport);
+    const mdHtml = await marked.parse(aiReportMarkdown);
     const content = `
       <!DOCTYPE html>
       <html>
       <head>
         <meta charset="utf-8">
-        <title>${selectedCompany.name} - Financial Report</title>
+        <title>${reportCompanyTitle} - Financial Report</title>
         <style>
           body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 2rem; color: #333; }
           img { max-width: 100%; height: auto; margin-bottom: 2rem; }
@@ -570,7 +1011,7 @@ export default function App() {
       </head>
       <body style="background: #f9fafb;">
         <div class="report-container">
-          <h1>${selectedCompany.name} - Financial Report</h1>
+          <h1>${reportCompanyTitle} - Financial Report</h1>
           ${mdHtml}
           ${chartsHtml}
           ${tablesHtml}
@@ -582,7 +1023,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${selectedCompany.name.replace(/\s+/g, '_')}_Report.html`;
+    a.download = `${reportCompanyTitle.replace(/\s+/g, '_')}_Report.html`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -598,13 +1039,15 @@ export default function App() {
     });
   };
 
+  const didRunInitialTabEffect = useRef(false);
   useEffect(() => {
     if (activeTab === 'all' || activeTab === 'results' || activeTab === 'discover') {
       fetchAnnouncements(activeTab === 'discover' ? 'results' : activeTab);
-      setSelectedCompany(null);
+      if (didRunInitialTabEffect.current) setSelectedCompany(null);
     } else if (activeTab === 'saved') {
-      setSelectedCompany(null);
+      if (didRunInitialTabEffect.current) setSelectedCompany(null);
     }
+    didRunInitialTabEffect.current = true;
   }, [activeTab, country]);
 
   const filteredAnnouncements = announcements.filter(a => 
@@ -616,7 +1059,7 @@ export default function App() {
   const isCompanySaved = (id: string) => savedCompanies.some(c => c.id === id);
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
+    <div className="editorial-app min-h-screen bg-gray-50 text-gray-900 font-sans">
       {/* Header */}
       <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -647,7 +1090,7 @@ export default function App() {
               </div>
             </div>
             <div className="flex items-center gap-4">
-              {user ? (
+              {(user || isLocalAdminAuthenticated) ? (
                 <button
                   onClick={handleLogout}
                   className="text-sm font-medium text-gray-600 hover:text-gray-900"
@@ -694,7 +1137,7 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Tabs */}
         <div className="flex space-x-1 bg-gray-100 p-1 rounded-lg w-fit mb-8 overflow-x-auto">
-          {isAdmin && (
+          {hasAdminAccess && (
             <button
               onClick={() => setActiveTab('admin')}
               className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -743,7 +1186,7 @@ export default function App() {
             <Radar className="h-4 w-4" />
             Stock Scanners
           </button>
-          {(visiblePages.portfolio || isAdmin) && (
+          {(visiblePages.portfolio || hasAdminAccess) && (
             <button
               onClick={() => setActiveTab('portfolio')}
               className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -767,7 +1210,7 @@ export default function App() {
 
         {/* Content Area */}
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
-          {activeTab === 'admin' && (
+          {activeTab === 'admin' && hasAdminAccess && (
             <div className="p-6 bg-white rounded-xl border border-gray-200 shadow-sm">
               <h2 className="text-xl font-bold text-gray-900 mb-4">Admin Dashboard</h2>
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -795,7 +1238,7 @@ export default function App() {
                       <label className="block text-xs font-medium text-gray-500 mb-1">Type</label>
                       <select 
                         value={portfolioForm.type}
-                        onChange={(e) => setPortfolioForm({...portfolioForm, type: e.target.value as any})}
+                        onChange={(e) => setPortfolioForm({...portfolioForm, type: e.target.value as PortfolioItem['type']})}
                         className="w-full text-sm border border-gray-300 rounded-md px-3 py-2"
                       >
                         <option value="SIP">SIP</option>
@@ -820,16 +1263,17 @@ export default function App() {
                             <button
                               key={company.symbol}
                               onClick={() => {
+                                const displayName = company.name || company.symbol;
                                 setPortfolioForm({
                                   ...portfolioForm,
-                                  name: company.companyName
+                                  name: displayName
                                 });
-                                setPortfolioSearchQuery(company.companyName);
+                                setPortfolioSearchQuery(displayName);
                                 setShowPortfolioResults(false);
                               }}
                               className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 transition-colors border-b border-gray-50 last:border-0"
                             >
-                              <div className="font-medium text-gray-900">{company.companyName}</div>
+                              <div className="font-medium text-gray-900">{company.name || company.symbol}</div>
                               <div className="text-[10px] text-gray-500">{company.symbol} • {company.exchange}</div>
                             </button>
                           ))}
@@ -894,40 +1338,283 @@ export default function App() {
             <div className="p-6">
               <div className="mb-8">
                 <h2 className="text-2xl font-bold text-gray-900 mb-2">Portfolio Showcase</h2>
-                <p className="text-gray-600">A curated view of strategic investments and SIPs.</p>
+                <p className="text-gray-600">Model strategies with historical date-based performance plus curated SIP/lumpsum picks.</p>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {portfolioItems.map((item) => (
-                  <div key={item.id} className="bg-white rounded-xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-all">
-                    <div className="flex justify-between items-start mb-4">
-                      <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
-                        item.type === 'SIP' ? 'bg-emerald-50 text-emerald-700' : 'bg-blue-50 text-blue-700'
-                      }`}>
-                        {item.type}
-                      </div>
-                      <div className="text-sm font-bold text-gray-900">
-                        ₹{item.amount.toLocaleString()}
-                      </div>
-                    </div>
-                    <h3 className="text-lg font-bold text-gray-900 mb-2">{item.name}</h3>
-                    <div className="flex items-center gap-2 text-xs text-gray-500 mb-4">
-                      <Calendar className="h-3.5 w-3.5" />
-                      Started: {format(new Date(item.date), 'MMM dd, yyyy')}
-                    </div>
-                    {item.description && (
-                      <p className="text-sm text-gray-600 line-clamp-2">{item.description}</p>
-                    )}
-                  </div>
-                ))}
+              <div className="mb-6 flex flex-wrap gap-2 rounded-lg border border-gray-200 bg-gray-50 p-2">
+                <button
+                  onClick={() => setPortfolioWorkspaceTab('strategy')}
+                  className={`px-3 py-1.5 rounded-md text-sm ${portfolioWorkspaceTab === 'strategy' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600'}`}
+                >
+                  Strategy Model Portfolio
+                </button>
+                <button
+                  onClick={() => setPortfolioWorkspaceTab('custom')}
+                  className={`px-3 py-1.5 rounded-md text-sm ${portfolioWorkspaceTab === 'custom' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600'}`}
+                >
+                  My Portfolio
+                </button>
               </div>
 
-              {portfolioItems.length === 0 && (
-                <div className="text-center py-20 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200">
-                  <BarChart3 className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                  <h3 className="text-lg font-medium text-gray-900">No portfolio items to show</h3>
-                  <p className="text-gray-500">Check back later for investment updates.</p>
+              {portfolioWorkspaceTab === 'strategy' && (
+              <div className="mb-8 border border-gray-200 rounded-xl p-5 bg-gray-50">
+                <h3 className="text-lg font-semibold text-gray-900 mb-2">Strategy Model Portfolios</h3>
+                <p className="text-sm text-gray-600 mb-4">High Risk, Medium Risk, Low Risk, and Dividend baskets (22 stocks each) with backtest-from-date support.</p>
+
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {STRATEGY_PORTFOLIOS.map((pf) => (
+                    <button
+                      key={pf.id}
+                      onClick={() => setStrategyTab(pf.id)}
+                      className={`px-3 py-1.5 rounded-md text-sm font-medium ${
+                        strategyTab === pf.id ? 'bg-blue-600 text-white' : 'bg-white border border-gray-200 text-gray-700'
+                      }`}
+                    >
+                      {pf.id === 'dividend' ? 'Dividend' : pf.riskLabel}
+                    </button>
+                  ))}
                 </div>
+
+                {selectedStrategyPf && (
+                  <>
+                    <div className="text-sm text-gray-700 mb-4">
+                      <div className="font-semibold text-gray-900">{selectedStrategyPf.title}</div>
+                      <div>{selectedStrategyPf.subtitle}</div>
+                    </div>
+                    <div className="flex flex-wrap items-end gap-3 mb-4">
+                      <label className="text-sm">
+                        <span className="block text-gray-600 mb-1">Investment date</span>
+                        <input
+                          type="date"
+                          value={strategyInvestDate}
+                          max={format(new Date(), 'yyyy-MM-dd')}
+                          min="2010-01-01"
+                          onChange={(e) => setStrategyInvestDate(e.target.value)}
+                          className="border border-gray-300 rounded-md px-2 py-1.5"
+                        />
+                      </label>
+                      <button
+                        onClick={() => void loadStrategyPerformance()}
+                        disabled={strategyPerfLoading}
+                        className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-60"
+                      >
+                        {strategyPerfLoading ? 'Loading...' : 'Update performance'}
+                      </button>
+                      <select
+                        value={strategyWeightMode}
+                        onChange={(e) => setStrategyWeightMode(e.target.value as 'equal' | 'best')}
+                        className="border border-gray-300 rounded-md px-2 py-2 text-sm"
+                      >
+                        <option value="equal">Equal weight</option>
+                        <option value="best">Best-weight spread</option>
+                      </select>
+                      <input
+                        type="number"
+                        value={strategyInvestmentAmount}
+                        onChange={(e) => setStrategyInvestmentAmount(Number(e.target.value) || 0)}
+                        className="border border-gray-300 rounded-md px-2 py-2 text-sm w-36"
+                        placeholder="Investment amount"
+                      />
+                    </div>
+                    {strategyPerfError && <p className="text-sm text-red-600 mb-3">{strategyPerfError}</p>}
+                    {strategyPerf && (
+                      <div className="mb-4 text-sm text-gray-700">
+                        Equal-weight return:{" "}
+                        <span className={(strategyPerf.equalWeightReturnPct ?? 0) >= 0 ? 'text-emerald-700 font-semibold' : 'text-red-700 font-semibold'}>
+                          {strategyPerf.equalWeightReturnPct == null ? 'N/A' : `${strategyPerf.equalWeightReturnPct >= 0 ? '+' : ''}${strategyPerf.equalWeightReturnPct.toFixed(2)}%`}
+                        </span>
+                        <span className="text-gray-500"> ({strategyPerf.countOk}/{strategyPerf.countTotal} symbols priced)</span>
+                        <div className="mt-2 text-xs text-gray-600">
+                          {(() => {
+                            const rows = (strategyPerf.symbols || []).filter((r) => r.returnPct != null);
+                            if (!rows.length) return 'Projected value: N/A';
+                            let weighted = 0;
+                            if (strategyWeightMode === 'equal') {
+                              weighted = rows.reduce((s, r) => s + Number(r.returnPct), 0) / rows.length;
+                            } else {
+                              const sorted = [...rows].sort((a, b) => Number(b.returnPct) - Number(a.returnPct));
+                              const top = sorted.slice(0, Math.max(1, Math.floor(sorted.length / 3)));
+                              const rest = sorted.slice(top.length);
+                              const topAvg = top.reduce((s, r) => s + Number(r.returnPct), 0) / top.length;
+                              const restAvg = rest.length ? rest.reduce((s, r) => s + Number(r.returnPct), 0) / rest.length : topAvg;
+                              weighted = topAvg * 0.55 + restAvg * 0.45;
+                            }
+                            const value = strategyInvestmentAmount * (1 + weighted / 100);
+                            return `Projected value (${strategyWeightMode === 'equal' ? 'equal' : 'best-weight'}): ₹${value.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+                          })()}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+              )}
+
+              {portfolioWorkspaceTab === 'custom' && (
+                <div className="mb-8 border border-gray-200 rounded-xl p-5 bg-gray-50 space-y-4">
+                  <div className="flex flex-wrap items-center gap-2 justify-between">
+                    <div className="font-semibold text-gray-900">My Portfolio (Custom)</div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          const id = `pf_${Date.now()}`;
+                          const name = `Portfolio ${customPortfolios.length + 1}`;
+                          setCustomPortfolios((prev) => [...prev, { id, name, holdings: [] }]);
+                          setActiveCustomPortfolioId(id);
+                        }}
+                        className="px-3 py-1.5 text-xs rounded border border-gray-300 bg-white"
+                      >
+                        Add Portfolio
+                      </button>
+                      {customPortfolios.length > 1 && (
+                        <button
+                          onClick={() => {
+                            setCustomPortfolios((prev) => prev.filter((p) => p.id !== activeCustomPortfolio.id));
+                            setActiveCustomPortfolioId('default');
+                          }}
+                          className="px-3 py-1.5 text-xs rounded border border-red-300 text-red-700 bg-white"
+                        >
+                          Delete Portfolio
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {customPortfolios.map((p) => (
+                      <button
+                        key={p.id}
+                        onClick={() => setActiveCustomPortfolioId(p.id)}
+                        className={`px-3 py-1.5 rounded-md text-sm ${p.id === activeCustomPortfolio.id ? 'bg-blue-600 text-white' : 'bg-white border border-gray-200 text-gray-700'}`}
+                      >
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={activeCustomPortfolio.name}
+                      onChange={(e) => setCustomPortfolios((prev) => prev.map((p) => p.id === activeCustomPortfolio.id ? { ...p, name: e.target.value } : p))}
+                      className="border border-gray-300 rounded-md px-2 py-1.5 text-sm"
+                    />
+                    <button
+                      onClick={() => setShowPortfolioView((v) => !v)}
+                      className="px-3 py-1.5 rounded-md text-sm bg-gray-900 text-white"
+                    >
+                      {showPortfolioView ? 'Hide Portfolio View' : 'View Portfolio'}
+                    </button>
+                  </div>
+
+                  <div className="text-xs text-gray-600">Add stocks from Discover/Announcements/Scanners/Research using <span className="font-semibold">Add to custom</span> buttons.</div>
+
+                  <div className="overflow-x-auto bg-white rounded-lg border border-gray-200">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-gray-50 text-xs text-gray-600 uppercase">
+                        <tr>
+                          <th className="px-3 py-2 text-left">Stock</th>
+                          <th className="px-3 py-2 text-left">Purchase Date</th>
+                          <th className="px-3 py-2 text-right">Amount</th>
+                          <th className="px-3 py-2 text-right">Qty</th>
+                          <th className="px-3 py-2 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {activeCustomPortfolio.holdings.map((h) => (
+                          <tr key={h.symbol} className="border-t border-gray-100">
+                            <td className="px-3 py-2">{h.name} <span className="text-xs text-gray-500">({h.symbol})</span></td>
+                            <td className="px-3 py-2">
+                              <input type="date" value={h.purchaseDate} onChange={(e) => updateHolding(h.symbol, { purchaseDate: e.target.value })} className="border border-gray-300 rounded px-1 py-1 text-xs" />
+                            </td>
+                            <td className="px-3 py-2 text-right">
+                              <input type="number" value={h.amount} onChange={(e) => updateHolding(h.symbol, { amount: Number(e.target.value) })} className="border border-gray-300 rounded px-1 py-1 w-24 text-xs text-right" />
+                            </td>
+                            <td className="px-3 py-2 text-right">
+                              <input type="number" value={h.quantity} onChange={(e) => updateHolding(h.symbol, { quantity: Number(e.target.value) })} className="border border-gray-300 rounded px-1 py-1 w-20 text-xs text-right" />
+                            </td>
+                            <td className="px-3 py-2 text-right">
+                              <button onClick={() => removeHolding(h.symbol)} className="text-xs text-red-600">Delete</button>
+                            </td>
+                          </tr>
+                        ))}
+                        {activeCustomPortfolio.holdings.length === 0 && (
+                          <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-500">No stocks yet.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {showPortfolioView && (
+                    <div className="overflow-x-auto bg-white rounded-lg border border-gray-200">
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-gray-50 text-xs text-gray-600 uppercase">
+                          <tr>
+                            <th className="px-3 py-2 text-left">Stock</th>
+                            <th className="px-3 py-2 text-right">Purchase Price</th>
+                            <th className="px-3 py-2 text-right">Current Price</th>
+                            <th className="px-3 py-2 text-right">Quantity</th>
+                            <th className="px-3 py-2 text-right">Investment Value</th>
+                            <th className="px-3 py-2 text-right">Market Value</th>
+                            <th className="px-3 py-2 text-right">Daily % Gain</th>
+                            <th className="px-3 py-2 text-right">Total % Gain</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeCustomPortfolio.holdings.map((h) => {
+                            const m = holdingMetrics[h.symbol];
+                            return (
+                              <tr key={`view_${h.symbol}`} className="border-t border-gray-100">
+                                <td className="px-3 py-2">{h.name}</td>
+                                <td className="px-3 py-2 text-right">{m?.purchasePrice?.toFixed ? m.purchasePrice.toFixed(2) : '-'}</td>
+                                <td className="px-3 py-2 text-right">{m?.currentPrice?.toFixed ? m.currentPrice.toFixed(2) : '-'}</td>
+                                <td className="px-3 py-2 text-right">{h.quantity}</td>
+                                <td className="px-3 py-2 text-right">{m?.investmentValue?.toFixed ? m.investmentValue.toFixed(2) : '-'}</td>
+                                <td className="px-3 py-2 text-right">{m?.marketValue?.toFixed ? m.marketValue.toFixed(2) : '-'}</td>
+                                <td className={`px-3 py-2 text-right ${m?.dailyPctGain >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>{m?.dailyPctGain?.toFixed ? `${m.dailyPctGain.toFixed(2)}%` : '-'}</td>
+                                <td className={`px-3 py-2 text-right ${m?.totalPctGain >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>{m?.totalPctGain?.toFixed ? `${m.totalPctGain.toFixed(2)}%` : '-'}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {portfolioWorkspaceTab === 'strategy' && (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {portfolioItems.map((item) => (
+                      <div key={item.id} className="bg-white rounded-xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-all">
+                        <div className="flex justify-between items-start mb-4">
+                          <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
+                            item.type === 'SIP' ? 'bg-emerald-50 text-emerald-700' : 'bg-blue-50 text-blue-700'
+                          }`}>
+                            {item.type}
+                          </div>
+                          <div className="text-sm font-bold text-gray-900">
+                            ₹{item.amount.toLocaleString()}
+                          </div>
+                        </div>
+                        <h3 className="text-lg font-bold text-gray-900 mb-2">{item.name}</h3>
+                        <div className="flex items-center gap-2 text-xs text-gray-500 mb-4">
+                          <Calendar className="h-3.5 w-3.5" />
+                          Started: {format(new Date(item.date), 'MMM dd, yyyy')}
+                        </div>
+                        {item.description && (
+                          <p className="text-sm text-gray-600 line-clamp-2">{item.description}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  {portfolioItems.length === 0 && (
+                    <div className="text-center py-20 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200">
+                      <BarChart3 className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+                      <h3 className="text-lg font-medium text-gray-900">No portfolio items to show</h3>
+                      <p className="text-gray-500">Check back later for investment updates.</p>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -979,6 +1666,12 @@ export default function App() {
                       </div>
                       
                       <div className="flex items-center gap-2 mt-auto">
+                        <button
+                          onClick={() => addToCustomPortfolio({ symbol: item.symbol, name: item.companyName })}
+                          className="px-2 py-2 bg-emerald-50 text-emerald-700 text-xs font-bold rounded-lg border border-emerald-200"
+                        >
+                          + Custom
+                        </button>
                         <button
                           onClick={() => {
                             const companyUrl = country === 'IN' 
@@ -1126,6 +1819,12 @@ export default function App() {
                                 {item.category === 'Result' && (
                                   <>
                                     <button
+                                      onClick={() => addToCustomPortfolio({ symbol: item.symbol, name: item.companyName })}
+                                      className="inline-flex items-center gap-1 text-emerald-700 hover:text-emerald-800 font-medium text-xs bg-emerald-50 px-2 py-1 rounded border border-emerald-100 transition-colors"
+                                    >
+                                      + Custom
+                                    </button>
+                                    <button
                                       onClick={() => {
                                         const companyUrl = country === 'IN' 
                                           ? `https://www.screener.in/company/${item.symbol}/`
@@ -1193,132 +1892,23 @@ export default function App() {
           )}
 
           {activeTab === 'scanners' && (
-            <div className="p-6">
-              {!selectedScanner ? (
-                <>
-                  <div className="mb-8">
-                    <h2 className="text-2xl font-bold text-gray-900 mb-2">Stock Scanners & Strategies</h2>
-                    <p className="text-gray-600">Discover potential investment opportunities using proven quantitative frameworks and screening criteria.</p>
-                  </div>
-                  
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {STRATEGIES.map((strategy) => (
-                          <div 
-                            key={strategy.id}
-                            onClick={() => {
-                              if (strategy.premium && !isPaidCustomer) {
-                                // Show premium modal or logic
-                                setIsPaidCustomer(false); // Just to trigger visual cue if needed
-                              } else {
-                                runScanner(strategy.id);
-                              }
-                            }}
-                            className={`bg-white rounded-xl border p-6 shadow-sm transition-all cursor-pointer group relative overflow-hidden ${
-                              strategy.premium && !isPaidCustomer ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 hover:shadow-md'
-                            }`}
-                          >
-                            {strategy.premium && (
-                              <div className="absolute top-0 right-0">
-                                <div className={`text-[10px] font-bold px-2 py-1 rounded-bl-lg flex items-center gap-1 ${
-                                  isPaidCustomer ? 'bg-green-100 text-green-700' : 'bg-amber-500 text-white'
-                                }`}>
-                                  <Sparkles className="h-2.5 w-2.5" />
-                                  {isPaidCustomer ? 'UNLOCKED' : 'PREMIUM'}
-                                </div>
-                              </div>
-                            )}
-                            <div className={`w-12 h-12 rounded-lg ${strategy.bgClass} flex items-center justify-center mb-4 group-hover:scale-110 transition-transform`}>
-                              {strategy.icon}
-                            </div>
-                            <h3 className="text-lg font-bold text-gray-900 mb-2">{strategy.label}</h3>
-                            <p className="text-sm text-gray-600 mb-4 h-10 line-clamp-2">{strategy.desc}</p>
-                            
-                            {strategy.premium && !isPaidCustomer ? (
-                              <button 
-                                onClick={(e) => { e.stopPropagation(); setIsPaidCustomer(true); }}
-                                className="w-full py-2 bg-amber-600 text-white rounded-lg font-bold text-xs hover:bg-amber-700 transition-colors flex items-center justify-center gap-2"
-                              >
-                                <Sparkles className="h-3.5 w-3.5" />
-                                Unlock Strategy
-                              </button>
-                            ) : (
-                              <button className={`text-sm font-medium ${strategy.textClass} flex items-center gap-1 group-hover:gap-2 transition-all`}>
-                                Run Scanner <ArrowLeft className="h-4 w-4 rotate-180" />
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                </>
-              ) : (
-                <div>
-                  <button 
-                    onClick={() => setSelectedScanner(null)}
-                    className="flex items-center gap-2 text-sm font-medium text-gray-600 hover:text-gray-900 mb-6"
-                  >
-                    <ArrowLeft className="h-4 w-4" />
-                    Back to Scanners
-                  </button>
-                  
-                  <div className="mb-8">
-                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                      {STRATEGIES.find(s => s.id === selectedScanner)?.label} Results
-                    </h2>
-                    <p className="text-gray-600">
-                      {STRATEGIES.find(s => s.id === selectedScanner)?.desc}
-                    </p>
-                  </div>
-
-                  {loadingScanner ? (
-                    <div className="text-center py-12">
-                      <RefreshCw className="h-8 w-8 animate-spin mx-auto text-blue-500 mb-4" />
-                      <p className="text-gray-500">Running scanner across all listed companies...</p>
-                    </div>
-                  ) : scannerResults.length > 0 ? (
-                    <div className="grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
-                      {scannerResults.map((company) => (
-                        <div 
-                          key={company.id} 
-                          className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow cursor-pointer"
-                          onClick={() => {
-                            openCompanyDashboard(company);
-                          }}
-                        >
-                          <div className="flex justify-between items-start mb-3">
-                            <h4 className="font-bold text-gray-900 text-lg line-clamp-1">{company.name}</h4>
-                            <button 
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleSaveCompany(company);
-                              }}
-                              className="text-gray-400 hover:text-blue-600 transition-colors"
-                            >
-                              {isCompanySaved(company.id) ? (
-                                <BookmarkCheck className="h-5 w-5 text-blue-600" />
-                              ) : (
-                                <BookmarkPlus className="h-5 w-5" />
-                              )}
-                            </button>
-                          </div>
-                          <div className="flex items-center gap-2 text-sm text-gray-500 mb-4">
-                            <span className="px-2 py-1 bg-gray-100 rounded text-xs font-medium">{company.exchange}</span>
-                          </div>
-                          <div className="flex items-center text-sm font-medium text-blue-600 group-hover:text-blue-800">
-                            View Analysis <ArrowLeft className="h-4 w-4 ml-1 rotate-180" />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-center py-12 bg-white rounded-xl border border-gray-200">
-                      <AlertCircle className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                      <h3 className="text-lg font-medium text-gray-900">No companies found</h3>
-                      <p className="text-gray-500 mt-2">No companies currently match this criteria.</p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <ScannerWorkspace
+              scannerWorkspaceTab={scannerWorkspaceTab}
+              setScannerWorkspaceTab={setScannerWorkspaceTab}
+              selectedScanner={selectedScanner}
+              setSelectedScanner={setSelectedScanner}
+              loadingScanner={loadingScanner}
+              scannerResults={scannerResults}
+              strategies={STRATEGIES}
+              isPaidCustomer={isPaidCustomer}
+              setIsPaidCustomer={setIsPaidCustomer}
+              runScanner={runScanner}
+              openCompanyDashboard={openCompanyDashboard}
+              addToCustomPortfolio={addToCustomPortfolio}
+              toggleSaveCompany={toggleSaveCompany}
+              isCompanySaved={isCompanySaved}
+              selectedCompanyName={selectedCompany?.name}
+            />
           )}
 
           {activeTab === 'companies' && !selectedCompany && (
@@ -1422,7 +2012,7 @@ export default function App() {
           )}
 
           {/* Company Dashboard View */}
-          {selectedCompany && (
+          {selectedCompany && (activeTab !== 'scanners' || scannerWorkspaceTab === 'reports') && (
             <div className="p-6">
               <div className="flex items-center justify-between mb-6">
                 <button 
@@ -1433,67 +2023,51 @@ export default function App() {
                   Back to {activeTab === 'saved' ? 'Saved' : 'Search'}
                 </button>
                 
-                <button
-                  onClick={() => toggleSaveCompany(selectedCompany)}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
-                    isCompanySaved(selectedCompany.id) 
-                      ? 'bg-blue-50 text-blue-700 hover:bg-blue-100' 
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  {isCompanySaved(selectedCompany.id) ? (
-                    <>
-                      <BookmarkCheck className="h-4 w-4" />
-                      Saved
-                    </>
-                  ) : (
-                    <>
-                      <BookmarkPlus className="h-4 w-4" />
-                      Save Company
-                    </>
-                  )}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => addToCustomPortfolio(selectedCompany)}
+                    className="flex items-center gap-2 px-4 py-2 rounded-md font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                  >
+                    + Add to custom
+                  </button>
+                  <button
+                    onClick={() => toggleSaveCompany(selectedCompany)}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
+                      isCompanySaved(selectedCompany.id) 
+                        ? 'bg-blue-50 text-blue-700 hover:bg-blue-100' 
+                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                    }`}
+                  >
+                    {isCompanySaved(selectedCompany.id) ? (
+                      <>
+                        <BookmarkCheck className="h-4 w-4" />
+                        Saved
+                      </>
+                    ) : (
+                      <>
+                        <BookmarkPlus className="h-4 w-4" />
+                        Save Company
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
 
-              <div className="mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h2 className={`text-2xl font-bold text-gray-900 transition-all ${!isPaidCustomer ? 'blur-md select-none' : ''}`}>
-                    {isPaidCustomer ? selectedCompany.name : 'HIDDEN COMPANY NAME'}
-                  </h2>
-                  {!isPaidCustomer && (
-                    <div className="mt-1 flex items-center gap-1.5 text-amber-600 text-xs font-semibold uppercase tracking-wider">
-                      <Sparkles className="h-3 w-3" />
-                      Unlock with Premium
-                    </div>
-                  )}
-                  <div className="flex items-center gap-3 mt-2">
-                    <span className="px-2.5 py-1 bg-gray-100 text-sm text-gray-700 rounded-md font-medium">
-                      {selectedCompany.exchange}
-                    </span>
-                    <a 
-                      href={selectedCompany.url} 
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1"
-                    >
-                      View on Screener <ExternalLink className="h-3 w-3" />
-                    </a>
-                  </div>
-                </div>
-                
-                <button
-                  onClick={generateReport}
-                  disabled={loadingReport}
-                  className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-md font-medium hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm disabled:opacity-70"
-                >
-                  {loadingReport ? (
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Sparkles className="h-4 w-4" />
-                  )}
-                  Generate AI Report
-                </button>
-              </div>
+              <ReportWorkspaceHeader
+                companyName={selectedCompany.name}
+                companyExchange={selectedCompany.exchange}
+                companyUrl={selectedCompany.url}
+                isPaidCustomer={isPaidCustomer}
+                reportType={reportType}
+                hideCompanyNameInReport={hideCompanyNameInReport}
+                loadingReport={loadingReport}
+                onReportTypeChange={setReportType}
+                onHideCompanyNameChange={(checked) => {
+                  setHideCompanyNameInReport(checked);
+                  setReportCompanyNameRevealed(false);
+                }}
+                onGenerateReport={generateReport}
+              />
 
               {showReport ? (
                 <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -1509,185 +2083,68 @@ export default function App() {
                     </div>
                   ) : reportData ? (
                     <div className="space-y-8">
-                      {/* Charts Section */}
-                      <div ref={chartsRef} className="grid grid-cols-1 lg:grid-cols-2 gap-6 bg-gray-50 p-4 rounded-xl -mx-4 sm:mx-0">
-                        <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
-                          {!isPaidCustomer && (
-                            <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center">
-                              <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-100 max-w-xs">
-                                <div className="w-12 h-12 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                                  <Sparkles className="h-6 w-6 text-amber-600" />
-                                </div>
-                                <h4 className="text-lg font-bold text-gray-900 mb-2">Premium Feature</h4>
-                                <p className="text-sm text-gray-600 mb-4">Upgrade to Premium to unlock detailed financial charts and AI-powered insights.</p>
-                                <button 
-                                  onClick={() => setIsPaidCustomer(true)}
-                                  className="w-full py-2 bg-amber-600 text-white rounded-lg font-bold text-sm hover:bg-amber-700 transition-colors"
-                                >
-                                  Unlock Now
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                          <h3 className="text-base font-semibold text-gray-800 mb-6 flex items-center gap-2">
-                            <BarChart3 className="h-5 w-5 text-blue-400" />
-                            Revenue vs Net Profit (Cr)
-                          </h3>
-                          <div className="h-72">
-                            <ResponsiveContainer width="100%" height="100%">
-                              <BarChart data={reportData.chartData} margin={{ top: 20, right: 10, left: -20, bottom: 0 }}>
-                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F3F4F6" />
-                                <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#9CA3AF' }} />
-                                <YAxis axisLine={false} tickLine={false} tickCount={5} tick={{ fontSize: 12, fill: '#9CA3AF' }} />
-                                <Tooltip 
-                                  cursor={{ fill: '#F9FAFB' }}
-                                  contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                                />
-                                <Legend wrapperStyle={{ paddingTop: '20px' }} iconType="circle" />
-                                <Bar dataKey="sales" name="Sales" fill="#3B82F6" radius={[6, 6, 0, 0]} barSize={28} isAnimationActive={false}>
-                                  <LabelList dataKey="sales" position="top" offset={8} style={{ fontSize: '10px', fill: '#94A3B8', fontWeight: 600 }} />
-                                </Bar>
-                                <Bar dataKey="netProfit" name="Net Profit" fill="#10B981" radius={[6, 6, 0, 0]} barSize={28} isAnimationActive={false}>
-                                  <LabelList dataKey="netProfit" position="top" offset={8} style={{ fontSize: '10px', fill: '#94A3B8', fontWeight: 600 }} />
-                                </Bar>
-                              </BarChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
+                      <ReportChartsSection
+                        reportData={reportData}
+                        isPaidCustomer={isPaidCustomer}
+                        setIsPaidCustomer={setIsPaidCustomer}
+                        chartsRef={chartsRef}
+                        activeChartPalette={activeChartPalette}
+                        country={country}
+                        chartPaletteByCountry={chartPaletteByCountry}
+                        setChartPaletteByCountry={setChartPaletteByCountry}
+                        rangedCandles={rangedCandles}
+                        priceActionMarkers={priceActionMarkers}
+                        loadingPriceCandles={loadingPriceCandles}
+                        technicalRange={technicalRange}
+                        setTechnicalRange={setTechnicalRange}
+                        projectionRows={projectionRows}
+                      />
 
-                        <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
-                          {!isPaidCustomer && (
-                            <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center">
-                              {/* Same overlay as above or simplified */}
-                            </div>
-                          )}
-                          <h3 className="text-base font-semibold text-gray-800 mb-6 flex items-center gap-2">
-                            <TrendingUp className="h-5 w-5 text-orange-400" />
-                            Earnings Per Share (EPS) Trend
-                          </h3>
-                          <div className="h-72">
-                            <ResponsiveContainer width="100%" height="100%">
-                              <LineChart data={reportData.chartData} margin={{ top: 20, right: 10, left: -20, bottom: 0 }}>
-                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F3F4F6" />
-                                <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#9CA3AF' }} />
-                                <YAxis axisLine={false} tickLine={false} tickCount={5} tick={{ fontSize: 12, fill: '#9CA3AF' }} />
-                                <Tooltip 
-                                  contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                                />
-                                <Legend wrapperStyle={{ paddingTop: '20px' }} iconType="circle" />
-                                <Line type="monotone" dataKey="eps" name="EPS (Rs)" stroke="#F59E0B" strokeWidth={3} dot={{ r: 4, fill: '#F59E0B', strokeWidth: 0 }} activeDot={{ r: 6 }} isAnimationActive={false}>
-                                  <LabelList dataKey="eps" position="top" offset={12} style={{ fontSize: '10px', fill: '#94A3B8', fontWeight: 600 }} />
-                                </Line>
-                              </LineChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-                      </div>
+                      <ReportFinancialTables reportData={reportData} />
 
-                      {/* Data Tables Section */}
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-                          <div className="bg-gray-50 px-6 py-4 border-b border-gray-200">
-                            <h3 className="font-semibold text-gray-900">Historical Results (Annual)</h3>
-                          </div>
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-left text-sm text-gray-600">
-                              <thead className="text-xs text-gray-500 uppercase bg-white border-b border-gray-200">
-                                <tr>
-                                  <th className="px-6 py-3 font-medium">Year</th>
-                                  <th className="px-6 py-3 font-medium text-right">Sales (Cr)</th>
-                                  <th className="px-6 py-3 font-medium text-right">Net Profit (Cr)</th>
-                                  <th className="px-6 py-3 font-medium text-right">EPS (Rs)</th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-gray-200">
-                                {reportData.chartData?.map((row: any, idx: number) => (
-                                  <tr key={idx} className="hover:bg-gray-50">
-                                    <td className="px-6 py-3 font-medium text-gray-900">{row.year}</td>
-                                    <td className="px-6 py-3 text-right">{row.sales}</td>
-                                    <td className="px-6 py-3 text-right">{row.netProfit}</td>
-                                    <td className="px-6 py-3 text-right">{row.eps}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-
-                        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-                          <div className="bg-gray-50 px-6 py-4 border-b border-gray-200">
-                            <h3 className="font-semibold text-gray-900">Latest Results (Quarterly)</h3>
-                          </div>
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-left text-sm text-gray-600">
-                              <thead className="text-xs text-gray-500 uppercase bg-white border-b border-gray-200">
-                                <tr>
-                                  <th className="px-6 py-3 font-medium">Quarter</th>
-                                  <th className="px-6 py-3 font-medium text-right">Sales (Cr)</th>
-                                  <th className="px-6 py-3 font-medium text-right">Net Profit (Cr)</th>
-                                  <th className="px-6 py-3 font-medium text-right">EPS (Rs)</th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-gray-200">
-                                {reportData.quarterlyData?.slice(-6).map((row: any, idx: number) => (
-                                  <tr key={idx} className="hover:bg-gray-50">
-                                    <td className="px-6 py-3 font-medium text-gray-900">{row.quarter}</td>
-                                    <td className="px-6 py-3 text-right">{row.sales}</td>
-                                    <td className="px-6 py-3 text-right">{row.netProfit}</td>
-                                    <td className="px-6 py-3 text-right">{row.eps}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* AI Report Markdown */}
-                      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden relative">
-                        {!isPaidCustomer && (
-                          <div className="absolute inset-x-0 bottom-0 top-[100px] z-10 bg-gradient-to-t from-white via-white/95 to-transparent flex flex-col items-center justify-center p-12 text-center">
-                            <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mb-6">
-                              <Sparkles className="h-8 w-8 text-blue-600" />
-                            </div>
-                            <h3 className="text-2xl font-bold text-gray-900 mb-3">Unlock Full AI Analysis</h3>
-                            <p className="text-gray-600 max-w-md mb-8">Get deep institutional-grade research, growth catalysts, and risk assessments for this company.</p>
-                            <button 
-                              onClick={() => setIsPaidCustomer(true)}
-                              className="px-8 py-3 bg-blue-600 text-white rounded-xl font-bold text-lg hover:bg-blue-700 transition-all shadow-lg hover:shadow-blue-200"
-                            >
-                              Upgrade to Premium
-                            </button>
-                          </div>
-                        )}
-                        <div className="bg-gradient-to-r from-blue-50 to-indigo-50 px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <Sparkles className="h-5 w-5 text-indigo-600" />
-                            <h3 className="font-semibold text-gray-900">AI Research Report</h3>
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <button 
-                              onClick={downloadMarkdown}
-                              className="flex items-center gap-1.5 text-sm font-medium text-blue-600 hover:text-blue-800 transition-colors bg-white px-3 py-1.5 rounded-md border border-blue-200 shadow-sm hover:shadow"
-                            >
-                              <Download className="h-4 w-4" />
-                              <span className="hidden sm:inline">Markdown</span>
-                              <span className="sm:hidden">MD</span>
-                            </button>
-                            <button 
-                              onClick={downloadHTML}
-                              className="flex items-center gap-1.5 text-sm font-medium text-blue-600 hover:text-blue-800 transition-colors bg-white px-3 py-1.5 rounded-md border border-blue-200 shadow-sm hover:shadow"
-                            >
-                              <Download className="h-4 w-4" />
-                              <span className="hidden sm:inline">HTML</span>
-                              <span className="sm:hidden">HTML</span>
-                            </button>
-                          </div>
-                        </div>
-                        <div className="p-8 markdown-body">
-                          <Markdown>{reportData.aiReport}</Markdown>
-                        </div>
-                      </div>
+                      <ReportInsightsPanel
+                        aiReportMarkdown={aiReportMarkdown}
+                        hideCompanyNameInReport={hideCompanyNameInReport}
+                        reportCompanyNameRevealed={reportCompanyNameRevealed}
+                        selectedCompanyName={selectedCompany.name}
+                        isPaidCustomer={isPaidCustomer}
+                        setIsPaidCustomer={setIsPaidCustomer}
+                        setReportCompanyNameRevealed={setReportCompanyNameRevealed}
+                        onDownloadMarkdown={downloadMarkdown}
+                        onDownloadHTML={downloadHTML}
+                        loadingJudge={loadingJudge}
+                        judgeData={judgeData}
+                        recencyValidation={recencyValidation}
+                        onRunJudgeValidation={() => void runJudgeValidation()}
+                        loadingSavedReports={loadingSavedReports}
+                        savedReports={savedReports}
+                        onRefreshSavedReports={() => void loadSavedReports()}
+                        reportScore={reportScore}
+                        outcomesSummary={outcomesSummary ? {
+                          horizonDays: outcomesSummary.horizonDays,
+                          hitRatePct: outcomesSummary.hitRatePct,
+                          avgReturnPct: outcomesSummary.avgReturnPct,
+                          usableRows: outcomesSummary.usableRows,
+                        } : null}
+                        loadingScoreAndOutcomes={loadingScoreAndOutcomes}
+                        degradedSourceWarnings={(reportData.parsingWarnings || []).length
+                          ? reportData.parsingWarnings || []
+                          : (judgeData?.missingComponents || []).filter((m) => m.includes("unreadable") || m.includes("missing"))}
+                        thesisMemory={thesisMemory ? {
+                          thesis: thesisMemory.thesis,
+                          status: thesisMemory.status,
+                          invalidationTriggers: thesisMemory.invalidationTriggers,
+                        } : null}
+                        positionSizing={positionSizing ? {
+                          riskBudgetPct: positionSizing.riskBudgetPct,
+                          stopLossPct: positionSizing.stopLossPct,
+                          suggestions: positionSizing.suggestions.map((s) => ({
+                            symbol: s.symbol,
+                            targetWeightPct: s.targetWeightPct,
+                            maxPositionValue: s.maxPositionValue,
+                          })),
+                        } : null}
+                      />
                     </div>
                   ) : (
                     <div className="py-12 text-center text-gray-500">
@@ -1702,82 +2159,7 @@ export default function App() {
                   <p className="text-gray-500">Fetching fundamental data...</p>
                 </div>
               ) : companyData ? (
-                <div className="space-y-8">
-                  {/* Key Metrics Grid */}
-                  <div>
-                    <h3 className="text-lg font-semibold text-gray-900 mb-4">Key Fundamentals</h3>
-                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                      {companyData.fundamentals.map((item: any, idx: number) => (
-                        <div key={idx} className="bg-gray-50 p-4 rounded-lg border border-gray-100">
-                          <div className="text-sm text-gray-500 mb-1">{item.name}</div>
-                          <div className="text-lg font-semibold text-gray-900">{item.value}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* About Section */}
-                  {companyData.about && (
-                    <div>
-                      <h3 className="text-lg font-semibold text-gray-900 mb-3">About Company</h3>
-                      <div className="bg-gray-50 p-5 rounded-lg border border-gray-100 text-gray-700 leading-relaxed text-sm">
-                        {companyData.about}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Recent Filings Section */}
-                  {companyData.recentAnnouncements && companyData.recentAnnouncements.length > 0 && (
-                    <div>
-                      <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                        <FileText className="h-5 w-5 text-blue-500" />
-                        Recent Exchange Filings & Documents
-                      </h3>
-                      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-                        <table className="w-full text-left text-sm text-gray-600">
-                          <thead className="text-xs text-gray-500 uppercase bg-gray-50 border-b border-gray-200">
-                            <tr>
-                              <th className="px-6 py-3 font-medium">Date</th>
-                              <th className="px-6 py-3 font-medium">Subject</th>
-                              <th className="px-6 py-3 font-medium text-right">Document</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-gray-200">
-                            {companyData.recentAnnouncements.map((item: any) => (
-                              <tr key={item.id} className="hover:bg-gray-50 transition-colors">
-                                <td className="px-6 py-3 whitespace-nowrap text-gray-500">
-                                  {item.date ? format(new Date(item.date), 'MMM dd, yyyy') : 'N/A'}
-                                </td>
-                                <td className="px-6 py-3">
-                                  <div className="font-medium text-gray-900 line-clamp-1" title={item.subject}>
-                                    {item.subject}
-                                  </div>
-                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 mt-1 uppercase">
-                                    {item.category || 'Filing'}
-                                  </span>
-                                </td>
-                                <td className="px-6 py-3 text-right">
-                                  {item.pdfLink ? (
-                                    <a 
-                                      href={item.pdfLink} 
-                                      target="_blank" 
-                                      rel="noopener noreferrer"
-                                      className="text-blue-600 hover:text-blue-800 font-medium inline-flex items-center gap-1"
-                                    >
-                                      View <ExternalLink className="h-3 w-3" />
-                                    </a>
-                                  ) : (
-                                    <span className="text-gray-400">N/A</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-                </div>
+                <FundamentalsPanel companyData={companyData} />
               ) : (
                 <div className="py-12 text-center text-gray-500">
                   <AlertCircle className="h-8 w-8 mx-auto text-gray-400 mb-4" />
@@ -1789,71 +2171,12 @@ export default function App() {
         </div>
       </main>
 
-      {/* Snapshot Modal */}
-      <AnimatePresence>
-        {showSnapshotModal && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 sm:p-6">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setShowSnapshotModal(false)}
-              className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm"
-            />
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-lg bg-white rounded-2xl shadow-2xl overflow-hidden border border-gray-200"
-            >
-              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-6 py-4 flex items-center justify-between">
-                <div className="flex items-center gap-2 text-white">
-                  <Sparkles className="h-5 w-5" />
-                  <h3 className="font-bold">Quick Result Snapshot</h3>
-                </div>
-                <button 
-                  onClick={() => setShowSnapshotModal(false)}
-                  className="text-white/80 hover:text-white transition-colors"
-                >
-                  <RefreshCw className="h-5 w-5 rotate-45" />
-                </button>
-              </div>
-              
-              <div className="p-6">
-                {loadingSnapshot ? (
-                  <div className="py-12 text-center">
-                    <RefreshCw className="h-8 w-8 animate-spin mx-auto text-indigo-600 mb-4" />
-                    <p className="text-gray-500 font-medium">Analyzing latest results...</p>
-                  </div>
-                ) : snapshotData ? (
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <h4 className="text-xl font-bold text-gray-900">{snapshotData.name}</h4>
-                      <span className="text-[10px] font-bold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded uppercase">Latest Insight</span>
-                    </div>
-                    <div className="prose prose-sm max-w-none text-gray-700 leading-relaxed">
-                      <Markdown>{snapshotData.snapshot}</Markdown>
-                    </div>
-                    <div className="pt-4 border-t border-gray-100 flex justify-end">
-                      <button 
-                        onClick={() => setShowSnapshotModal(false)}
-                        className="px-4 py-2 bg-gray-900 text-white text-sm font-bold rounded-lg hover:bg-gray-800 transition-colors"
-                      >
-                        Got it
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="py-8 text-center text-gray-500">
-                    <AlertCircle className="h-8 w-8 mx-auto text-red-400 mb-3" />
-                    <p>Failed to generate snapshot. Please try again.</p>
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
+      <SnapshotModal
+        open={showSnapshotModal}
+        loading={loadingSnapshot}
+        snapshotData={snapshotData}
+        onClose={() => setShowSnapshotModal(false)}
+      />
     </div>
   );
 }
