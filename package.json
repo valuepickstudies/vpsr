@@ -8,7 +8,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:report-utils": "tsx --test tests/report-utils.test.ts",
+    "test:report-contracts": "tsx --test tests/report-contracts.test.ts",
+    "test:portfolio-contracts": "tsx --test tests/portfolio-contracts.test.ts",
+    "test:market-contracts": "tsx --test tests/market-contracts.test.ts",
+    "test:price-history-contracts": "tsx --test tests/price-history-contracts.test.ts",
+    "test:saved-report-contracts": "tsx --test tests/saved-report-contracts.test.ts",
+    "test:fundamentals-contracts": "tsx --test tests/fundamentals-contracts.test.ts",
+    "test:core": "tsx --test tests/report-utils.test.ts tests/report-contracts.test.ts tests/portfolio-contracts.test.ts tests/market-contracts.test.ts tests/price-history-contracts.test.ts tests/saved-report-contracts.test.ts tests/fundamentals-contracts.test.ts tests/report-scoring.test.ts",
+    "test:workflow-smoke": "tsx tests/workflow-smoke.ts"
   },
   "dependencies": {
     "@google/genai": "^1.49.0",

@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
-dotenv.config({ override: true });
+dotenv.config({ path: ".env.local" });
+dotenv.config();
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
@@ -10,14 +11,22 @@ import { format, subDays } from "date-fns";
 import * as cheerio from "cheerio";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
+import { STRATEGY_PORTFOLIOS } from "./strategyPortfolios";
+import type { CompanyReportData, ReportAnnouncement, ReportChartRow, ReportQuarterlyRow, ReportType } from "./shared/reportTypes";
+import { assessReportQuality, parseScreenerFinancials } from "./reportUtils";
+import { buildReportScorecard } from "./reportScoring";
+import { isCompanySnapshotData, isQualityGateResult, normalizeCompanyReportData, normalizeJudgeValidationData, normalizeRecencyValidationData } from "./shared/reportContracts";
+import { normalizeAnnouncements, normalizeCompanyFundamentals, normalizeCompanySearchResults, normalizePriceHistoryData } from "./shared/marketContracts";
+import { normalizeSavedReportDetail, normalizeSavedReportList } from "./shared/savedReportContracts";
 
+const SEC_USER_AGENT = "MarketIntelligenceBot/1.0 (valuepicks25@gmail.com)";
 let cikToTicker: Record<string, string> = {};
 
 async function fetchTickerMapping() {
   try {
     console.log("[SEC] Fetching ticker mapping...");
     const res = await axios.get('https://www.sec.gov/files/company_tickers.json', {
-      headers: { 'User-Agent': 'MarketIntelligenceBot/1.0 (valuepicks25@gmail.com)' }
+      headers: { 'User-Agent': SEC_USER_AGENT }
     });
     const data = res.data;
     Object.values(data).forEach((item: any) => {
@@ -63,6 +72,571 @@ async function fetchWithRetry(url: string, options: any = {}, retries = 2) {
   }
 }
 
+type DailyPriceCandle = {
+  date: string;
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+};
+
+type ApiMetrics = {
+  requestsTotal: number;
+  errorsTotal: number;
+  queueEnqueued: number;
+  queueCompleted: number;
+  queueFailed: number;
+  avgLatencyMs: number;
+};
+
+type OutcomeRefreshJob = {
+  id: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  status: "queued" | "running" | "completed" | "failed";
+  input: { country: string; horizons: number[]; limit: number };
+  result?: { processedReports: number; refreshedOutcomes: number; horizons: number[] };
+  error?: string;
+};
+
+function normalizeIndianAnnouncementCategory(input: string): string {
+  const v = String(input || "").toLowerCase();
+  if (v.includes("result")) return "Result";
+  if (v.includes("board")) return "Board meeting";
+  if (v.includes("compliance")) return "Compliance";
+  if (v.includes("investor")) return "Investor update";
+  if (v.includes("action")) return "Corporate action";
+  return input || "General";
+}
+
+function announcementProcessingFingerprint(input: {
+  symbol?: string | null;
+  companyName?: string | null;
+  subject?: string | null;
+  date?: string | null;
+  category?: string | null;
+}): string {
+  const symbol = String(input.symbol || "").trim().toUpperCase();
+  const company = String(input.companyName || "").trim().toUpperCase();
+  const subject = String(input.subject || "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "")
+    .trim()
+    .toUpperCase()
+    .slice(0, 120);
+  const category = String(input.category || "").trim().toUpperCase();
+  const day = input.date ? new Date(input.date).toISOString().slice(0, 10) : "";
+  return `${symbol}::${company}::${category}::${day}::${subject}`;
+}
+
+function toIndianYmd(input: Date): string {
+  return format(input, "dd-MM-yyyy");
+}
+
+function parseIndianYmd(input: string): string | null {
+  const v = String(input || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const m = v.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (!m) return null;
+  const dd = m[1].padStart(2, "0");
+  const mm = m[2].padStart(2, "0");
+  const yyyy = m[3];
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function extractCookieHeader(setCookie: string[] | undefined): string {
+  if (!Array.isArray(setCookie) || !setCookie.length) return "";
+  return setCookie.map((c) => String(c).split(";")[0]).join("; ");
+}
+
+async function fetchNseEquityDailyHistory(symbol: string, fromDate: string, toDate: string): Promise<DailyPriceCandle[]> {
+  const warmup = await axios.get("https://www.nseindia.com", {
+    headers: {
+      "User-Agent": USER_AGENTS[0],
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    timeout: 10000,
+  });
+  const cookie = extractCookieHeader(warmup.headers["set-cookie"]);
+  const response = await axios.get("https://www.nseindia.com/api/historical/cm/equity", {
+    params: {
+      symbol: symbol.toUpperCase(),
+      series: '["EQ"]',
+      from: toIndianYmd(new Date(`${fromDate}T00:00:00+05:30`)),
+      to: toIndianYmd(new Date(`${toDate}T00:00:00+05:30`)),
+    },
+    headers: {
+      "User-Agent": USER_AGENTS[0],
+      Accept: "application/json",
+      Referer: "https://www.nseindia.com/",
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
+    timeout: 15000,
+  });
+  const rows = response.data?.data || [];
+  const candles: DailyPriceCandle[] = [];
+  for (const row of rows) {
+    const date = parseIndianYmd(row?.CH_TIMESTAMP || row?.mTIMESTAMP || row?.date);
+    const open = Number(row?.CH_OPENING_PRICE ?? row?.open ?? row?.OPEN);
+    const high = Number(row?.CH_TRADE_HIGH_PRICE ?? row?.high ?? row?.HIGH);
+    const low = Number(row?.CH_TRADE_LOW_PRICE ?? row?.low ?? row?.LOW);
+    const close = Number(row?.CH_CLOSING_PRICE ?? row?.close ?? row?.CLOSE);
+    if (!date || ![open, high, low, close].every((v) => Number.isFinite(v))) continue;
+    const volume = Number(row?.CH_TOT_TRADED_QTY ?? row?.volume ?? row?.TOTTRDQTY);
+    candles.push({
+      date,
+      ts: Date.parse(`${date}T00:00:00Z`),
+      open,
+      high,
+      low,
+      close,
+      volume: Number.isFinite(volume) ? volume : null,
+    });
+  }
+  candles.sort((a, b) => a.ts - b.ts);
+  return candles;
+}
+
+async function fetchBseDailySeriesFromScripCode(scripCode: string): Promise<DailyPriceCandle[]> {
+  const response = await fetchWithRetry(
+    `https://api.bseindia.com/BseIndiaAPI/api/StockReachGraph/w?scripcode=${encodeURIComponent(scripCode)}&flag=0&fromdate=&todate=`,
+    {
+      headers: {
+        Accept: "application/json",
+        Referer: `https://www.bseindia.com/stock-share-price/stockreach_graph.aspx?scripcode=${encodeURIComponent(scripCode)}`,
+      },
+      timeout: 15000,
+    }
+  );
+  const rows = response?.data?.Data || response?.data?.data || [];
+  const candles: DailyPriceCandle[] = [];
+  for (const row of rows) {
+    const rawDate = row?.TDate || row?.date || row?.Date;
+    const date = rawDate ? new Date(rawDate).toISOString().slice(0, 10) : null;
+    const close = Number(row?.Close ?? row?.close ?? row?.value ?? row?.YValue);
+    if (!date || !Number.isFinite(close)) continue;
+    const open = Number(row?.Open ?? row?.open);
+    const high = Number(row?.High ?? row?.high);
+    const low = Number(row?.Low ?? row?.low);
+    candles.push({
+      date,
+      ts: Date.parse(`${date}T00:00:00Z`),
+      open: Number.isFinite(open) ? open : close,
+      high: Number.isFinite(high) ? high : close,
+      low: Number.isFinite(low) ? low : close,
+      close,
+      volume: null,
+    });
+  }
+  candles.sort((a, b) => a.ts - b.ts);
+  return candles;
+}
+
+async function fetchYahooDailyHistory(symbol: string, fromDate: string, toDate: string): Promise<DailyPriceCandle[]> {
+  const period1 = Math.floor(new Date(`${fromDate}T00:00:00Z`).getTime() / 1000);
+  const period2 = Math.floor(new Date(`${toDate}T23:59:59Z`).getTime() / 1000);
+  const response = await axios.get(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${period1}&period2=${period2}`,
+    {
+      headers: {
+        "User-Agent": USER_AGENTS[0],
+        Accept: "application/json",
+      },
+      timeout: 15000,
+    }
+  );
+  const chart = response.data?.chart?.result?.[0];
+  const timestamps: number[] = chart?.timestamp || [];
+  const quote = chart?.indicators?.quote?.[0] || {};
+  const opens: Array<number | null> = quote?.open || [];
+  const highs: Array<number | null> = quote?.high || [];
+  const lows: Array<number | null> = quote?.low || [];
+  const closes: Array<number | null> = quote?.close || [];
+  const volumes: Array<number | null> = quote?.volume || [];
+  const candles: DailyPriceCandle[] = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const tsMs = Number(timestamps[i]) * 1000;
+    const open = Number(opens[i]);
+    const high = Number(highs[i]);
+    const low = Number(lows[i]);
+    const close = Number(closes[i]);
+    if (!Number.isFinite(tsMs) || ![open, high, low, close].every((v) => Number.isFinite(v))) continue;
+    const date = new Date(tsMs).toISOString().slice(0, 10);
+    const volume = Number(volumes[i]);
+    candles.push({
+      date,
+      ts: tsMs,
+      open,
+      high,
+      low,
+      close,
+      volume: Number.isFinite(volume) ? volume : null,
+    });
+  }
+  candles.sort((a, b) => a.ts - b.ts);
+  return candles;
+}
+
+function normalizeIndianTradingSymbol(input: string): string {
+  return String(input || "").trim().toUpperCase().replace(/\.NS$|\.BO$/i, "");
+}
+
+async function fetchIndianDailySeriesFromExchanges(inputSymbol: string, fromDate: string, toDate = format(new Date(), "yyyy-MM-dd")): Promise<DailyPriceCandle[]> {
+  const raw = String(inputSymbol || "").trim().toUpperCase();
+  const base = normalizeIndianTradingSymbol(raw);
+  const tries: Array<() => Promise<DailyPriceCandle[]>> = [];
+  if (/^\d{6}$/.test(base)) {
+    tries.push(() => fetchBseDailySeriesFromScripCode(base));
+  }
+  if (/^[A-Z0-9\-]+$/.test(base)) {
+    tries.push(() => fetchNseEquityDailyHistory(base, fromDate, toDate));
+    tries.push(() => fetchYahooDailyHistory(`${base}.NS`, fromDate, toDate));
+    tries.push(() => fetchYahooDailyHistory(`${base}.BO`, fromDate, toDate));
+  }
+  if (!tries.length) throw new Error(`Unsupported Indian symbol format: ${inputSymbol}`);
+
+  let lastErr: any = null;
+  for (const run of tries) {
+    try {
+      const candles = await run();
+      if (candles.length) return candles.filter((c) => c.date >= fromDate && c.date <= toDate);
+    } catch (e: any) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error(`No candle data found from NSE/BSE for ${inputSymbol}`);
+}
+
+function parseUsSymbol(inputUrl: string, hintedSymbol?: string | null): string | null {
+  const hinted = String(hintedSymbol || "").trim().toUpperCase();
+  if (hinted) return hinted;
+  const fromQuotePath = inputUrl.match(/\/quote\/([^\/\?]+)/i)?.[1];
+  if (fromQuotePath) return fromQuotePath.trim().toUpperCase();
+  const fromNasdaqPath = inputUrl.match(/\/stocks\/([^\/\?]+)/i)?.[1];
+  if (fromNasdaqPath) return fromNasdaqPath.trim().toUpperCase();
+  const raw = String(inputUrl || "").trim().toUpperCase();
+  if (/^[A-Z.\-]{1,10}$/.test(raw)) return raw;
+  return null;
+}
+
+function parseNasdaqMoneyToNumber(value: string | null | undefined): number | null {
+  const clean = String(value || "")
+    .replace(/[$,%]/g, "")
+    .replace(/,/g, "")
+    .trim();
+  const n = Number(clean);
+  return Number.isFinite(n) ? n : null;
+}
+
+type UsIncomeRow = ReportChartRow;
+type UsQuarterRow = ReportQuarterlyRow;
+type NasdaqHistoryCacheRow = {
+  candles: DailyPriceCandle[];
+  fetchedAt: number;
+};
+const nasdaqDailyHistoryCache = new Map<string, NasdaqHistoryCacheRow>();
+const NASDAQ_HISTORY_CACHE_TTL_MS = 20 * 60 * 1000;
+
+function pickLatestSecFact(
+  units: Array<any>,
+  opts?: { forms?: string[]; fps?: string[] }
+): any | null {
+  const forms = new Set((opts?.forms || []).map((v) => v.toUpperCase()));
+  const fps = new Set((opts?.fps || []).map((v) => v.toUpperCase()));
+  const filtered = units.filter((row) => {
+    const formOk = forms.size === 0 || forms.has(String(row.form || "").toUpperCase());
+    const fpOk = fps.size === 0 || fps.has(String(row.fp || "").toUpperCase());
+    return formOk && fpOk && Number.isFinite(Number(row.val));
+  });
+  if (!filtered.length) return null;
+  filtered.sort((a, b) => {
+    const bTs = Date.parse(String(b.end || b.filed || "")) || 0;
+    const aTs = Date.parse(String(a.end || a.filed || "")) || 0;
+    return bTs - aTs;
+  });
+  return filtered[0];
+}
+
+async function fetchNasdaqQuoteInfo(symbol: string): Promise<any | null> {
+  try {
+    const response = await axios.get(`https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/info?assetclass=stocks`, {
+      headers: { "User-Agent": USER_AGENTS[0], Accept: "application/json" },
+      timeout: 10000,
+    });
+    return response.data?.data || null;
+  } catch (e: any) {
+    console.warn(`[NASDAQ] quote info failed for ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+async function fetchNasdaqDailyHistory(symbol: string, fromDate: string): Promise<DailyPriceCandle[]> {
+  const cacheKey = `${symbol.toUpperCase()}::${fromDate}`;
+  const cached = nasdaqDailyHistoryCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < NASDAQ_HISTORY_CACHE_TTL_MS) {
+    return cached.candles;
+  }
+
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await axios.get(`https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/historical?assetclass=stocks&fromdate=${encodeURIComponent(fromDate)}&limit=3650`, {
+        headers: {
+          "User-Agent": USER_AGENTS[attempt % USER_AGENTS.length],
+          Accept: "application/json",
+        },
+        timeout: 15000,
+      });
+      const rows = response.data?.data?.tradesTable?.rows || [];
+      const candles: DailyPriceCandle[] = [];
+      for (const row of rows) {
+        const dt = String(row.date || "");
+        const [mm, dd, yyyy] = dt.split("/");
+        if (!yyyy || !mm || !dd) continue;
+        const date = `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+        const open = parseNasdaqMoneyToNumber(row.open);
+        const high = parseNasdaqMoneyToNumber(row.high);
+        const low = parseNasdaqMoneyToNumber(row.low);
+        const close = parseNasdaqMoneyToNumber(row.close);
+        if ([open, high, low, close].some((v) => v == null)) continue;
+        candles.push({
+          date,
+          ts: Date.parse(`${date}T00:00:00Z`),
+          open: open as number,
+          high: high as number,
+          low: low as number,
+          close: close as number,
+          volume: parseNasdaqMoneyToNumber(row.volume),
+        });
+      }
+      candles.sort((a, b) => a.ts - b.ts);
+      nasdaqDailyHistoryCache.set(cacheKey, { candles, fetchedAt: Date.now() });
+      return candles;
+    } catch (e: any) {
+      lastErr = e;
+      const status = e?.response?.status;
+      if (status === 429 || status === 503) {
+        const retryAfterSec = Number(e?.response?.headers?.["retry-after"] || 0);
+        const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? retryAfterSec * 1000
+          : (attempt + 1) * 1200;
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      break;
+    }
+  }
+
+  // If provider is rate-limited, prefer stale cached data over hard failure.
+  if (cached?.candles?.length) {
+    console.warn(`[NASDAQ] Using stale cached history for ${symbol} after upstream error`);
+    return cached.candles;
+  }
+
+  throw lastErr;
+}
+
+async function fetchUsSecProfileAndSeries(symbol: string): Promise<{
+  companyName: string;
+  cik: string;
+  annual: UsIncomeRow[];
+  quarterly: UsQuarterRow[];
+  latestAnnualRevenue: number | null;
+  latestAnnualNetIncome: number | null;
+  latestAnnualEps: number | null;
+}> {
+  const mapResp = await axios.get("https://www.sec.gov/files/company_tickers.json", {
+    headers: { "User-Agent": SEC_USER_AGENT, Accept: "application/json" },
+    timeout: 12000,
+  });
+  const entries: any[] = Object.values(mapResp.data || {});
+  const hit = entries.find((row) => String(row.ticker || "").toUpperCase() === symbol.toUpperCase());
+  if (!hit) throw new Error(`SEC mapping not found for symbol: ${symbol}`);
+  const cik = String(hit.cik_str || "").padStart(10, "0");
+  const companyName = String(hit.title || symbol);
+  const factsResp = await axios.get(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, {
+    headers: { "User-Agent": SEC_USER_AGENT, Accept: "application/json" },
+    timeout: 15000,
+  });
+  const usGaap = factsResp.data?.facts?.["us-gaap"] || {};
+  const revenuesRaw = usGaap.Revenues?.units?.USD
+    || usGaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units?.USD
+    || usGaap.SalesRevenueNet?.units?.USD
+    || [];
+  const netIncomeRaw = usGaap.NetIncomeLoss?.units?.USD || [];
+  const epsRaw = usGaap.EarningsPerShareDiluted?.units?.USD_per_shares
+    || usGaap.EarningsPerShareBasic?.units?.USD_per_shares
+    || [];
+
+  const annualMap = new Map<string, { sales?: number; netProfit?: number; eps?: number }>();
+  const revenueAnnual = revenuesRaw.filter((r: any) => String(r.fp || "").toUpperCase() === "FY" || String(r.form || "").toUpperCase() === "10-K");
+  const netAnnual = netIncomeRaw.filter((r: any) => String(r.fp || "").toUpperCase() === "FY" || String(r.form || "").toUpperCase() === "10-K");
+  const epsAnnual = epsRaw.filter((r: any) => String(r.fp || "").toUpperCase() === "FY" || String(r.form || "").toUpperCase() === "10-K");
+
+  for (const row of revenueAnnual) {
+    const y = String(row.fy || "").trim() || new Date(row.end).getFullYear().toString();
+    if (!annualMap.has(y)) annualMap.set(y, {});
+    annualMap.get(y)!.sales = Number(row.val);
+  }
+  for (const row of netAnnual) {
+    const y = String(row.fy || "").trim() || new Date(row.end).getFullYear().toString();
+    if (!annualMap.has(y)) annualMap.set(y, {});
+    annualMap.get(y)!.netProfit = Number(row.val);
+  }
+  for (const row of epsAnnual) {
+    const y = String(row.fy || "").trim() || new Date(row.end).getFullYear().toString();
+    if (!annualMap.has(y)) annualMap.set(y, {});
+    annualMap.get(y)!.eps = Number(row.val);
+  }
+
+  const annual = Array.from(annualMap.entries())
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .slice(-8)
+    .map(([year, v]) => ({
+      year,
+      sales: Number.isFinite(v.sales) ? Number((Number(v.sales) / 1_000_000).toFixed(2)) : 0,
+      netProfit: Number.isFinite(v.netProfit) ? Number((Number(v.netProfit) / 1_000_000).toFixed(2)) : 0,
+      eps: Number.isFinite(v.eps) ? Number(Number(v.eps).toFixed(2)) : 0,
+    }));
+
+  const quarterMap = new Map<string, { sales?: number; netProfit?: number; eps?: number; ts: number }>();
+  const qFp = new Set(["Q1", "Q2", "Q3", "Q4"]);
+  for (const row of revenuesRaw) {
+    const fp = String(row.fp || "").toUpperCase();
+    if (!qFp.has(fp)) continue;
+    const key = `${row.fy || ""}-${fp}`;
+    quarterMap.set(key, { ...(quarterMap.get(key) || { ts: Date.parse(row.end) || 0 }), sales: Number(row.val), ts: Date.parse(row.end) || 0 });
+  }
+  for (const row of netIncomeRaw) {
+    const fp = String(row.fp || "").toUpperCase();
+    if (!qFp.has(fp)) continue;
+    const key = `${row.fy || ""}-${fp}`;
+    quarterMap.set(key, { ...(quarterMap.get(key) || { ts: Date.parse(row.end) || 0 }), netProfit: Number(row.val), ts: Date.parse(row.end) || 0 });
+  }
+  for (const row of epsRaw) {
+    const fp = String(row.fp || "").toUpperCase();
+    if (!qFp.has(fp)) continue;
+    const key = `${row.fy || ""}-${fp}`;
+    quarterMap.set(key, { ...(quarterMap.get(key) || { ts: Date.parse(row.end) || 0 }), eps: Number(row.val), ts: Date.parse(row.end) || 0 });
+  }
+  const quarterly = Array.from(quarterMap.entries())
+    .sort((a, b) => a[1].ts - b[1].ts)
+    .slice(-12)
+    .map(([k, v]) => ({
+      quarter: k,
+      sales: Number.isFinite(v.sales) ? Number((Number(v.sales) / 1_000_000).toFixed(2)) : 0,
+      netProfit: Number.isFinite(v.netProfit) ? Number((Number(v.netProfit) / 1_000_000).toFixed(2)) : 0,
+      eps: Number.isFinite(v.eps) ? Number(Number(v.eps).toFixed(2)) : 0,
+    }));
+
+  const latestAnnualRevenue = Number(pickLatestSecFact(revenuesRaw, { forms: ["10-K"], fps: ["FY"] })?.val ?? NaN);
+  const latestAnnualNetIncome = Number(pickLatestSecFact(netIncomeRaw, { forms: ["10-K"], fps: ["FY"] })?.val ?? NaN);
+  const latestAnnualEps = Number(pickLatestSecFact(epsRaw, { forms: ["10-K"], fps: ["FY"] })?.val ?? NaN);
+  return {
+    companyName,
+    cik,
+    annual,
+    quarterly,
+    latestAnnualRevenue: Number.isFinite(latestAnnualRevenue) ? latestAnnualRevenue : null,
+    latestAnnualNetIncome: Number.isFinite(latestAnnualNetIncome) ? latestAnnualNetIncome : null,
+    latestAnnualEps: Number.isFinite(latestAnnualEps) ? latestAnnualEps : null,
+  };
+}
+
+function resolveIndianExchangeSymbol(url: string, hintedSymbol?: string | null): string | null {
+  const hinted = String(hintedSymbol || "").trim().toUpperCase();
+  if (hinted) {
+    if (hinted.endsWith(".NS") || hinted.endsWith(".BO")) return hinted.slice(0, -3);
+    return hinted;
+  }
+  const slug = url.match(/\/company\/([^\/\?]+)/i)?.[1]?.trim().toUpperCase() || "";
+  if (slug) {
+    return slug;
+  }
+  return null;
+}
+
+async function secEdgarGet(url: string, timeout = 10000): Promise<{ data: string }> {
+  let lastErr: any;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await axios.get<string>(url, {
+        headers: {
+          "User-Agent": SEC_USER_AGENT,
+          Accept: "application/atom+xml, application/xml, text/xml, */*",
+          "Accept-Encoding": "gzip, deflate",
+        },
+        timeout,
+        responseType: "text",
+      });
+      return res;
+    } catch (e: any) {
+      lastErr = e;
+      if ((e.response?.status === 429 || e.response?.status === 503) && i < 2) {
+        await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+function normalizeSecTicker(symbol: string): string {
+  return String(symbol || "").trim().toUpperCase().replace(/-/g, ".");
+}
+
+type SecFilingRow = { id: string; date: string; subject: string; pdfLink?: string; category: string };
+
+async function fetchSecFilingsForTicker(symbol: string, count: number, idPrefix: string): Promise<SecFilingRow[]> {
+  const sym = normalizeSecTicker(symbol);
+  if (!sym) return [];
+  const formTypes = ["10-Q", "10-K", "8-K"];
+  const perType = Math.min(40, Math.max(8, Math.ceil(count / formTypes.length) + 3));
+  const merged: Array<SecFilingRow & { _ts: number }> = [];
+  const seenLinks = new Set<string>();
+
+  for (const formType of formTypes) {
+    const secSearchUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&ticker=${encodeURIComponent(sym)}&type=${encodeURIComponent(formType)}&dateb=&owner=include&count=${perType}&output=atom`;
+    try {
+      const secResponse = await secEdgarGet(secSearchUrl, 8000);
+      const $sec = cheerio.load(secResponse.data, { xmlMode: true });
+      $sec("entry").each((_, el) => {
+        const entry = $sec(el);
+        const title = entry.find("title").text().trim();
+        if (!title) return;
+        if (/^\s*.+\(\s*\d{7,10}\s*\)\s*$/i.test(title)) return;
+        const link = entry.find('link[type="text/html"]').attr("href") || entry.find("link").attr("href") || "";
+        if (link && seenLinks.has(link)) return;
+        if (link) seenLinks.add(link);
+        const updated = entry.find("updated").text();
+        merged.push({
+          id: "",
+          date: updated,
+          subject: title,
+          pdfLink: link || undefined,
+          category: title.split(" - ")[0]?.trim() || formType,
+          _ts: Date.parse(updated) || 0,
+        });
+      });
+    } catch (e: any) {
+      console.warn(`[SEC] ${formType} feed failed for ${sym}:`, e.message);
+    }
+  }
+
+  merged.sort((a, b) => b._ts - a._ts);
+  return merged.slice(0, count).map((row, i) => ({
+    id: `${idPrefix}${sym}_${i}`,
+    date: row.date,
+    subject: row.subject,
+    pdfLink: row.pdfLink,
+    category: row.category,
+  }));
+}
+
 function formatAIError(e: any): string {
   const msg = e.message || String(e);
   try {
@@ -76,7 +650,117 @@ function formatAIError(e: any): string {
   return msg;
 }
 
-async function generateAIReport(name: string, country: string, chartData: any[], quarterlyData: any[], announcements: any[]) {
+const GEMINI_MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+let cachedGeminiModels: { models: string[]; fetchedAt: number } | null = null;
+
+function isLikelyRateOrQuotaError(errorMessage: string): boolean {
+  const msg = errorMessage.toLowerCase();
+  return (
+    msg.includes("quota exceeded")
+    || msg.includes("rate limit")
+    || msg.includes("too many requests")
+    || msg.includes("429")
+    || msg.includes("resource_exhausted")
+  );
+}
+
+function modelPriorityScore(modelName: string): number {
+  const n = modelName.toLowerCase();
+  if (n.includes("gemini-2.0-flash-lite")) return 500;
+  if (n.includes("gemini-2.0-flash")) return 450;
+  if (n.includes("gemini-1.5-flash")) return 420;
+  if (n.includes("gemini-2.5-flash")) return 350;
+  if (n.includes("gemini-1.5-pro")) return 240;
+  if (n.includes("gemini-2.5-pro")) return 210;
+  if (n.includes("gemini")) return 100;
+  return 1;
+}
+
+async function listAvailableGeminiTextModels(ai: GoogleGenAI): Promise<string[]> {
+  const now = Date.now();
+  if (cachedGeminiModels && now - cachedGeminiModels.fetchedAt < GEMINI_MODEL_CACHE_TTL_MS) {
+    return cachedGeminiModels.models;
+  }
+  const discovered: string[] = [];
+  try {
+    const pager: any = await ai.models.list();
+    for await (const model of pager) {
+      const name = String(model?.name || "").trim();
+      const actions: string[] = Array.isArray(model?.supportedActions) ? model.supportedActions : [];
+      if (!name) continue;
+      if (!actions.includes("generateContent")) continue;
+      const lower = name.toLowerCase();
+      if (!lower.includes("gemini")) continue;
+      if (
+        lower.includes("tts")
+        || lower.includes("image")
+        || lower.includes("embedding")
+        || lower.includes("aqa")
+        || lower.includes("robotics")
+        || lower.includes("computer-use")
+      ) continue;
+      discovered.push(name);
+    }
+  } catch (e: any) {
+    console.warn("[AI] Model discovery failed; using fallback static list:", e.message);
+  }
+
+  const fallback = [
+    "models/gemini-2.0-flash-lite",
+    "models/gemini-2.0-flash-lite-001",
+    "models/gemini-2.0-flash",
+    "models/gemini-2.0-flash-001",
+    "models/gemini-1.5-flash",
+    "models/gemini-1.5-flash-8b",
+    "models/gemini-1.5-pro",
+    "models/gemini-2.5-flash",
+    "models/gemini-2.5-pro",
+  ];
+
+  const unique = Array.from(new Set([...discovered, ...fallback]));
+  unique.sort((a, b) => modelPriorityScore(b) - modelPriorityScore(a));
+  cachedGeminiModels = { models: unique, fetchedAt: now };
+  return unique;
+}
+
+async function generateWithAnyGeminiModel(
+  ai: GoogleGenAI,
+  prompt: string,
+): Promise<{ text: string; model: string } | { error: string }> {
+  const models = await listAvailableGeminiTextModels(ai);
+  let lastError = "unknown_error";
+  const tried: string[] = [];
+
+  for (const model of models) {
+    tried.push(model);
+    try {
+      const result = await ai.models.generateContent({
+        model,
+        contents: prompt,
+      });
+      const text = String(result?.text || "").trim();
+      if (text) return { text, model };
+      lastError = `${model}: empty_response`;
+    } catch (e: any) {
+      const friendly = formatAIError(e);
+      lastError = `${model}: ${friendly}`;
+      if (!isLikelyRateOrQuotaError(friendly)) {
+        console.warn(`[AI] Model failed (${model}):`, friendly);
+      }
+    }
+  }
+  return { error: `All discovered Gemini models failed. Last error: ${lastError}. Tried: ${tried.join(", ")}` };
+}
+
+async function generateAIReport(
+  name: string,
+  country: string,
+  chartData: ReportChartRow[],
+  quarterlyData: ReportQuarterlyRow[],
+  announcements: ReportAnnouncement[],
+  currentPrice?: string | number | null,
+  reportType: ReportType = "standard",
+) {
   try {
     const apiKey = (process.env.GEMINI_API_KEY || "").trim();
     if (!apiKey) {
@@ -84,8 +768,35 @@ async function generateAIReport(name: string, country: string, chartData: any[],
       return "AI analysis is currently unavailable (API Key not configured).";
     }
 
-    const ai = new GoogleGenAI(apiKey);
+    const ai = new GoogleGenAI({ apiKey });
+    const styleInstruction =
+      reportType === "deep"
+        ? "Write a deep institutional report (long-form, highly detailed, with explicit assumptions and scenario analysis)."
+        : reportType === "quick"
+          ? "Write a concise executive report (short, punchy, decision-oriented). Keep it brief."
+          : "Write a standard professional equity research report with balanced detail.";
+
+    const sectionInstruction =
+      reportType === "quick"
+        ? `Structure with the following sections:
+1. **Investment Thesis & Summary**
+2. **Key Financial Highlights**
+3. **Top 3 Catalysts**
+4. **Top 3 Risks**
+5. **Valuation View**
+6. **Actionable Takeaway**`
+        : `Structure the report EXACTLY with the following sections, providing detailed, professional insights for each:
+1. **Investment Thesis & Summary**
+2. **Business Model & Operations**
+3. **Historical Financial Review**
+4. **Growth Drivers & Catalysts**
+5. **Risk Assessment**
+6. **Valuation & Price Target**
+7. **Management Quality & Governance**
+8. **Competitive Positioning**`;
+
     const prompt = `You are an expert financial analyst. Write a comprehensive, world-class equity research report for ${name} (${country === 'US' ? 'USA' : 'India'}). 
+${styleInstruction}
     
 Ensure you analyze the LATEST available data, including recent quarterly results and any recent exchange filings.
 
@@ -98,28 +809,26 @@ ${JSON.stringify(quarterlyData.slice(-4))}
 Recent Filings (Latest):
 ${JSON.stringify(announcements.map((a: any) => ({ date: a.date, subject: a.subject })))}
 
-Structure the report EXACTLY with the following sections, providing detailed, professional insights for each:
-1. **Investment Thesis & Summary**
-2. **Business Model & Operations**
-3. **Historical Financial Review**
-4. **Growth Drivers & Catalysts**
-5. **Risk Assessment**
-6. **Valuation & Price Target**
-7. **Management Quality & Governance**
-8. **Competitive Positioning**
+Current Market Price (authoritative):
+${currentPrice ?? "N/A"}
+
+${sectionInstruction}
 
 Use markdown formatting. Make it read like a premium institutional research report.`;
 
-    const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    return response.text() || "AI analysis is currently unavailable.";
+    const result = await generateWithAnyGeminiModel(ai, prompt);
+    if ("error" in result) {
+      return `AI analysis is currently unavailable. Error: ${result.error}`;
+    }
+    console.log(`[AI] Report generated with model: ${result.model}`);
+    return result.text || "AI analysis is currently unavailable.";
   } catch (e: any) {
     const friendlyError = formatAIError(e);
     console.error("[AI] Generation failed:", friendlyError);
     return `AI analysis is currently unavailable. Error: ${friendlyError}`;
   }
 }
+
 
 async function generateQuickSnapshot(name: string, country: string, chartData: any[], quarterlyData: any[], announcements: any[]) {
   try {
@@ -130,7 +839,7 @@ async function generateQuickSnapshot(name: string, country: string, chartData: a
       return "Snapshot unavailable (API Key not configured).";
     }
 
-    const ai = new GoogleGenAI(apiKey);
+    const ai = new GoogleGenAI({ apiKey });
     const prompt = `You are a financial analyst. Provide a 3-sentence "Quick Snapshot" of the latest results for ${name}. 
     Focus on: 
     1. Revenue/Profit growth (YoY or QoQ).
@@ -144,10 +853,12 @@ async function generateQuickSnapshot(name: string, country: string, chartData: a
     
     Keep it extremely concise and professional. Use bullet points.`;
 
-    const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    return response.text() || "No snapshot available.";
+    const result = await generateWithAnyGeminiModel(ai, prompt);
+    if ("error" in result) {
+      return `Snapshot generation failed: ${result.error}`;
+    }
+    console.log(`[AI] Snapshot generated with model: ${result.model}`);
+    return result.text || "No snapshot available.";
   } catch (e: any) {
     const friendlyError = formatAIError(e);
     console.error("[AI] Snapshot failed:", friendlyError);
@@ -158,9 +869,59 @@ async function generateQuickSnapshot(name: string, country: string, chartData: a
 async function startServer() {
   const app = express();
   const PORT = 3000;
+  const ADMIN_API_KEY = String(process.env.ADMIN_API_KEY || "").trim();
+  const metrics: ApiMetrics = {
+    requestsTotal: 0,
+    errorsTotal: 0,
+    queueEnqueued: 0,
+    queueCompleted: 0,
+    queueFailed: 0,
+    avgLatencyMs: 0,
+  };
+  const outcomeJobs = new Map<string, OutcomeRefreshJob>();
+  const outcomeQueue: string[] = [];
+  let outcomeWorkerRunning = false;
 
   app.use(cors());
   app.use(express.json());
+  app.use((req, res, next) => {
+    const startedAt = Date.now();
+    const reqId = Math.random().toString(36).slice(2, 10);
+    res.locals.reqId = reqId;
+    res.setHeader("X-Request-Id", reqId);
+    res.on("finish", () => {
+      const durationMs = Date.now() - startedAt;
+      const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+      metrics.requestsTotal += 1;
+      if (res.statusCode >= 500) metrics.errorsTotal += 1;
+      metrics.avgLatencyMs = metrics.avgLatencyMs === 0
+        ? durationMs
+        : Number((metrics.avgLatencyMs * 0.9 + durationMs * 0.1).toFixed(2));
+      const payload = {
+        event: "http_request",
+        reqId,
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durationMs,
+      };
+      if (level === "error") console.error("[HTTP]", JSON.stringify(payload));
+      else if (level === "warn") console.warn("[HTTP]", JSON.stringify(payload));
+      else console.log("[HTTP]", JSON.stringify(payload));
+    });
+    next();
+  });
+
+  function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (!ADMIN_API_KEY) {
+      return res.status(503).json({ success: false, error: "admin_api_key_not_configured" });
+    }
+    const token = String(req.headers["x-admin-key"] || "");
+    if (!token || token !== ADMIN_API_KEY) {
+      return res.status(403).json({ success: false, error: "forbidden_admin_only" });
+    }
+    next();
+  }
 
   // Initialize SQLite Database
   const db = await open({
@@ -181,18 +942,261 @@ async function startServer() {
     )
   `);
 
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS saved_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      companyName TEXT NOT NULL,
+      symbol TEXT,
+      country TEXT NOT NULL,
+      sourceUrl TEXT NOT NULL,
+      reportJson TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS strategy_perf_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      symbol TEXT NOT NULL,
+      startDate TEXT NOT NULL,
+      payloadJson TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      UNIQUE(symbol, startDate)
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS report_outcomes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reportId INTEGER NOT NULL,
+      symbol TEXT NOT NULL,
+      country TEXT NOT NULL,
+      horizonDays INTEGER NOT NULL,
+      reportDate TEXT NOT NULL,
+      entryDate TEXT,
+      entryPrice REAL,
+      targetDate TEXT,
+      targetPrice REAL,
+      returnPct REAL,
+      status TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      UNIQUE(reportId, horizonDays)
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS company_thesis_memory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      symbol TEXT NOT NULL,
+      country TEXT NOT NULL,
+      thesis TEXT NOT NULL,
+      invalidationTriggersJson TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      invalidatedReason TEXT,
+      invalidatedAt TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      UNIQUE(symbol, country)
+    )
+  `);
+
+  async function saveGeneratedReport(input: {
+    companyName: string;
+    symbol?: string | null;
+    country: string;
+    sourceUrl: string;
+    report: CompanyReportData;
+  }) {
+    await db.run(
+      `INSERT INTO saved_reports (companyName, symbol, country, sourceUrl, reportJson, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        input.companyName,
+        input.symbol || null,
+        input.country,
+        input.sourceUrl,
+        JSON.stringify(input.report),
+        new Date().toISOString(),
+      ]
+    );
+  }
+
+  async function computeForwardOutcomeForReport(input: {
+    reportId: number;
+    symbol: string;
+    country: "IN" | "US";
+    reportDateIso: string;
+    horizonDays: number;
+  }) {
+    const symbol = input.symbol.trim();
+    const reportDate = new Date(input.reportDateIso);
+    if (!symbol || Number.isNaN(reportDate.getTime())) {
+      return { status: "invalid_input" as const };
+    }
+    const fetchFrom = format(subDays(reportDate, 10), "yyyy-MM-dd");
+    const targetDate = format(new Date(reportDate.getTime() + input.horizonDays * 24 * 60 * 60 * 1000), "yyyy-MM-dd");
+    const candles = input.country === "US"
+      ? await fetchNasdaqDailyHistory(symbol, fetchFrom)
+      : await fetchIndianDailySeriesFromExchanges(symbol, fetchFrom);
+    if (!candles.length) return { status: "no_price_series" as const };
+    const reportYmd = format(reportDate, "yyyy-MM-dd");
+    const entry = candles.find((c) => c.date >= reportYmd) || candles[0];
+    const target = candles.find((c) => c.date >= targetDate) || candles[candles.length - 1];
+    if (!entry || !target || !Number.isFinite(entry.close) || !Number.isFinite(target.close) || entry.close <= 0) {
+      return { status: "invalid_price_points" as const };
+    }
+    const returnPct = ((target.close / entry.close) - 1) * 100;
+    return {
+      status: "ok" as const,
+      entryDate: entry.date,
+      entryPrice: entry.close,
+      targetDate: target.date,
+      targetPrice: target.close,
+      returnPct,
+    };
+  }
+
+  async function refreshOutcomes(input: { country: string; horizons: number[]; limit: number }) {
+    const country = String(input.country || "").trim().toUpperCase();
+    const horizons = Array.isArray(input.horizons) && input.horizons.length
+      ? input.horizons.map((h) => Number(h)).filter((n) => Number.isFinite(n) && n > 0)
+      : [30, 90, 180];
+    const lim = Math.min(300, Math.max(1, Number(input.limit || 120)));
+    const rows: Array<{ id: number; symbol: string | null; country: string; createdAt: string }> = await db.all(
+      `SELECT id, symbol, country, createdAt
+       FROM saved_reports
+       ${country ? "WHERE country = ?" : ""}
+       ORDER BY datetime(createdAt) DESC
+       LIMIT ${lim}`,
+      country ? [country] : []
+    );
+    let processed = 0;
+    let refreshed = 0;
+    for (const row of rows) {
+      processed += 1;
+      if (!row.symbol) continue;
+      const normalizedCountry = row.country === "US" ? "US" : "IN";
+      for (const horizonDays of horizons) {
+        let status = "failed";
+        let entryDate: string | null = null;
+        let entryPrice: number | null = null;
+        let targetDate: string | null = null;
+        let targetPrice: number | null = null;
+        let returnPct: number | null = null;
+        try {
+          const out = await computeForwardOutcomeForReport({
+            reportId: row.id,
+            symbol: row.symbol,
+            country: normalizedCountry,
+            reportDateIso: row.createdAt,
+            horizonDays,
+          });
+          status = out.status;
+          if (out.status === "ok") {
+            entryDate = out.entryDate;
+            entryPrice = out.entryPrice;
+            targetDate = out.targetDate;
+            targetPrice = out.targetPrice;
+            returnPct = out.returnPct;
+          }
+        } catch (e: unknown) {
+          status = e instanceof Error ? e.message : "refresh_failed";
+        }
+        await db.run(
+          `INSERT INTO report_outcomes
+           (reportId, symbol, country, horizonDays, reportDate, entryDate, entryPrice, targetDate, targetPrice, returnPct, status, createdAt, updatedAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(reportId, horizonDays) DO UPDATE SET
+             symbol=excluded.symbol,
+             country=excluded.country,
+             reportDate=excluded.reportDate,
+             entryDate=excluded.entryDate,
+             entryPrice=excluded.entryPrice,
+             targetDate=excluded.targetDate,
+             targetPrice=excluded.targetPrice,
+             returnPct=excluded.returnPct,
+             status=excluded.status,
+             updatedAt=excluded.updatedAt`,
+          [
+            row.id,
+            row.symbol,
+            normalizedCountry,
+            horizonDays,
+            row.createdAt,
+            entryDate,
+            entryPrice,
+            targetDate,
+            targetPrice,
+            returnPct,
+            status,
+            new Date().toISOString(),
+            new Date().toISOString(),
+          ]
+        );
+        refreshed += 1;
+      }
+    }
+    return { processedReports: processed, refreshedOutcomes: refreshed, horizons };
+  }
+
+  async function drainOutcomeQueue() {
+    if (outcomeWorkerRunning) return;
+    outcomeWorkerRunning = true;
+    while (outcomeQueue.length) {
+      const jobId = outcomeQueue.shift() as string;
+      const job = outcomeJobs.get(jobId);
+      if (!job) continue;
+      job.status = "running";
+      job.startedAt = new Date().toISOString();
+      try {
+        const result = await refreshOutcomes(job.input);
+        job.result = result;
+        job.status = "completed";
+        job.finishedAt = new Date().toISOString();
+        metrics.queueCompleted += 1;
+      } catch (e: unknown) {
+        job.status = "failed";
+        job.error = e instanceof Error ? e.message : "queue_job_failed";
+        job.finishedAt = new Date().toISOString();
+        metrics.queueFailed += 1;
+      }
+      outcomeJobs.set(job.id, job);
+    }
+    outcomeWorkerRunning = false;
+  }
+
   // Background Sync Function
-  async function syncAnnouncements() {
+  async function syncAnnouncements(options?: { includeAllListedCorporateAnnouncements?: boolean }) {
     try {
+      const lastStored = await db.get<{ maxDate: string | null }>("SELECT MAX(date) as maxDate FROM announcements");
+      const lastTs = lastStored?.maxDate ? new Date(lastStored.maxDate).getTime() : null;
+      const basePrevDate = lastTs && Number.isFinite(lastTs) ? subDays(new Date(lastTs), 1) : subDays(new Date(), 30);
       const today = new Date();
-      const prevDate = subDays(today, 7); // Fetch last 7 days to ensure we don't miss anything
+      const prevDate = basePrevDate;
       const strToDate = format(today, "yyyyMMdd");
       const strPrevDate = format(prevDate, "yyyyMMdd");
       
       let newCount = 0;
       let totalFound = 0;
+      let duplicatesSkipped = 0;
+      let staleSkipped = 0;
+      let resultsProcessed = 0;
+      let nonResultProcessed = 0;
 
-      // Fetch multiple categories and pages to ensure we get a good spread of recent data
+      const recentRows = await db.all("SELECT symbol, companyName, subject, date, category FROM announcements ORDER BY date DESC LIMIT 5000");
+      const seenFingerprints = new Set<string>(
+        recentRows.map((r: any) =>
+          announcementProcessingFingerprint({
+            symbol: r.symbol,
+            companyName: r.companyName,
+            subject: r.subject,
+            date: r.date,
+            category: normalizeIndianAnnouncementCategory(r.category),
+          })
+        )
+      );
+
       const categoriesToFetch = ["-1", "Result", "Financial Result", "Outcome of Board Meeting"];
       
       for (const cat of categoriesToFetch) {
@@ -216,7 +1220,24 @@ async function startServer() {
 
           for (const item of data) {
             const pdfLink = item.ATTACHMENTNAME ? `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${item.ATTACHMENTNAME}` : null;
-            
+            const normalizedCategory = normalizeIndianAnnouncementCategory(item.CATEGORYNAME);
+            const itemDate = item.DT_TM ? new Date(item.DT_TM).getTime() : null;
+            if (lastTs && itemDate && itemDate <= lastTs) {
+              staleSkipped++;
+              continue;
+            }
+            const fp = announcementProcessingFingerprint({
+              symbol: item.SCRIP_CD,
+              companyName: item.SLONGNAME,
+              subject: item.NEWSSUB,
+              date: item.DT_TM,
+              category: normalizedCategory,
+            });
+            if (seenFingerprints.has(fp)) {
+              duplicatesSkipped++;
+              continue;
+            }
+            seenFingerprints.add(fp);
             const result = await db.run(`
               INSERT OR IGNORE INTO announcements (id, symbol, companyName, subject, date, pdfLink, exchange, category)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -228,17 +1249,86 @@ async function startServer() {
               item.DT_TM,
               pdfLink,
               "BSE",
-              item.CATEGORYNAME
+              normalizedCategory
             ]);
 
             if (result.changes && result.changes > 0) {
               newCount++;
+              if (normalizedCategory === "Result") resultsProcessed++;
+              else nonResultProcessed++;
             }
           }
         }
       }
+
+      if (options?.includeAllListedCorporateAnnouncements !== false) {
+        try {
+          const universe = await fetchWithRetry("https://www.nseindia.com/api/market-data-pre-open?key=ALL", {
+            headers: { Accept: "application/json", Referer: "https://www.nseindia.com/" },
+            timeout: 15000,
+          });
+          const symbols = (universe?.data?.data || [])
+            .map((r: any) => r?.metadata?.symbol || r?.symbol)
+            .filter(Boolean)
+            .slice(0, 1200);
+          for (const sym of symbols) {
+            try {
+              const ca = await fetchWithRetry(`https://www.nseindia.com/api/corporate-announcements?symbol=${encodeURIComponent(sym)}`, {
+                headers: { Accept: "application/json", Referer: "https://www.nseindia.com/" },
+                timeout: 12000,
+              });
+              const rows = ca?.data || [];
+              for (const r of rows.slice(0, 12)) {
+                const category = normalizeIndianAnnouncementCategory(r?.caSubject || r?.subject || "General");
+                const date = r?.an_dt || r?.bcStartDate || r?.date || "";
+                const itemDate = date ? new Date(date).getTime() : null;
+                if (lastTs && itemDate && itemDate <= lastTs) {
+                  staleSkipped++;
+                  continue;
+                }
+                const fp = announcementProcessingFingerprint({
+                  symbol: sym,
+                  companyName: r?.sm_name || r?.companyName || sym,
+                  subject: r?.caSubject || r?.subject || "",
+                  date,
+                  category,
+                });
+                if (seenFingerprints.has(fp)) {
+                  duplicatesSkipped++;
+                  continue;
+                }
+                seenFingerprints.add(fp);
+                const id = r?.attchmntFile || r?.an_id || `${sym}_${Date.parse(date || String(Date.now()))}_${Math.random().toString(36).slice(2, 7)}`;
+                const pdfLink = r?.attchmntFile ? `https://nsearchives.nseindia.com${r.attchmntFile}` : null;
+                const insert = await db.run(
+                  `INSERT OR IGNORE INTO announcements (id, symbol, companyName, subject, date, pdfLink, exchange, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    String(id),
+                    sym,
+                    r?.sm_name || sym,
+                    r?.caSubject || r?.subject || "Corporate Announcement",
+                    date || new Date().toISOString(),
+                    pdfLink,
+                    "NSE",
+                    category,
+                  ]
+                );
+                if (insert.changes && insert.changes > 0) {
+                  newCount++;
+                  if (category === "Result") resultsProcessed++;
+                  else nonResultProcessed++;
+                }
+              }
+            } catch {
+              // best-effort for symbols that fail
+            }
+          }
+        } catch (nseErr: any) {
+          console.warn("[Sync] NSE all-listed pass failed:", nseErr.message);
+        }
+      }
       
-      console.log(`[Sync] Found ${totalFound} announcements. Inserted ${newCount} new records.`);
+      console.log(`[Sync] Found ${totalFound}. Inserted ${newCount}. Duplicates ${duplicatesSkipped}. Stale ${staleSkipped}. Results ${resultsProcessed}, non-results ${nonResultProcessed}.`);
     } catch (error: any) {
       console.error("[Sync] Error syncing announcements:", error.message);
     }
@@ -353,7 +1443,7 @@ async function startServer() {
               category: itemCategory
             });
           });
-          return res.json({ success: true, data: secAnnouncements });
+          return res.json({ success: true, data: normalizeAnnouncements(secAnnouncements) });
         } catch (secError: any) {
           console.error("Error fetching SEC filings:", secError.message);
           return res.status(500).json({ success: false, error: "Failed to fetch SEC filings" });
@@ -363,15 +1453,44 @@ async function startServer() {
       // Trigger a sync in the background to ensure fresh data for next time
       syncAnnouncements();
 
-      let query = "SELECT * FROM announcements ORDER BY date DESC LIMIT 500";
-      let params: any[] = [];
+      const rows = await db.all("SELECT * FROM announcements ORDER BY date DESC LIMIT 4000");
+      const normalized = rows.map((r: any) => ({
+        ...r,
+        category: normalizeIndianAnnouncementCategory(r.category),
+      }));
 
       if (type === "results") {
-        query = "SELECT * FROM announcements WHERE category = 'Result' ORDER BY date DESC LIMIT 500";
+        // Only keep companies whose latest announcement overall is a Result,
+        // then return that latest result row.
+        const latestOverallByCompany = new Map<string, any>();
+        const latestResultByCompany = new Map<string, any>();
+        for (const row of normalized) {
+          const key = `${row.symbol || ""}::${row.companyName || ""}`;
+          if (!latestOverallByCompany.has(key)) latestOverallByCompany.set(key, row);
+          if (row.category === "Result" && !latestResultByCompany.has(key)) latestResultByCompany.set(key, row);
+        }
+        const filtered = Array.from(latestResultByCompany.entries())
+          .filter(([key]) => latestOverallByCompany.get(key)?.category === "Result")
+          .map(([, row]) => row)
+          .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        return res.json({ success: true, data: normalizeAnnouncements(filtered) });
       }
 
-      const announcements = await db.all(query, params);
-      res.json({ success: true, data: announcements });
+      const dedup = new Map<string, any>();
+      for (const row of normalized) {
+        const key = announcementProcessingFingerprint({
+          symbol: row.symbol,
+          companyName: row.companyName,
+          subject: row.subject,
+          date: row.date,
+          category: row.category,
+        });
+        if (!dedup.has(key)) dedup.set(key, row);
+      }
+      const data = Array.from(dedup.values())
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+        .slice(0, 500);
+      res.json({ success: true, data: normalizeAnnouncements(data) });
     } catch (error: any) {
       console.error("Error fetching announcements:", error.message);
       res.status(500).json({ success: false, error: "Failed to fetch announcements" });
@@ -387,49 +1506,20 @@ async function startServer() {
       }
 
       if (country === 'US') {
-        // Try Alpaca for search if keys are available
-        if (process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
-          try {
-            console.log(`[Search] Fetching US companies from Alpaca for: ${search}`);
-            // Alpaca doesn't have a direct "search" endpoint with partial match in the free tier easily,
-            // but we can fetch assets and filter. However, for a quick search, Yahoo is still better for partial matches.
-            // But let's try to get the exact asset if it's a symbol.
-            const alpacaRes = await axios.get(`https://paper-api.alpaca.markets/v2/assets/${(search as string).toUpperCase()}`, {
-              headers: {
-                'APCA-API-KEY-ID': process.env.ALPACA_API_KEY,
-                'APCA-API-SECRET-KEY': process.env.ALPACA_SECRET_KEY,
-              },
-              timeout: 3000
-            });
-            if (alpacaRes.data && alpacaRes.data.tradable) {
-              return res.json({ success: true, data: [{
-                id: alpacaRes.data.symbol,
-                name: alpacaRes.data.name,
-                url: `https://finance.yahoo.com/quote/${alpacaRes.data.symbol}`,
-                exchange: alpacaRes.data.exchange,
-                symbol: alpacaRes.data.symbol
-              }] });
-            }
-          } catch (e) {
-            // Fallback to Yahoo search if Alpaca exact match fails
-          }
-        }
-
-        // Use Yahoo Finance search for US companies
-        const yahooSearchUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(search as string)}&quotesCount=10&newsCount=0`;
-        const response = await fetchWithRetry(yahooSearchUrl, { timeout: 8000 });
-        
-        const companies = (response.data.quotes || [])
-          .filter((q: any) => q.quoteType === 'EQUITY')
+        const response = await axios.get(`https://api.nasdaq.com/api/autocomplete/slookup/10?search=${encodeURIComponent(String(search))}`, {
+          headers: { "User-Agent": USER_AGENTS[0], Accept: "application/json" },
+          timeout: 10000,
+        });
+        const companies = (response.data?.data || [])
+          .filter((q: any) => String(q.asset || "").toUpperCase() === "STOCKS")
           .map((q: any) => ({
             id: q.symbol,
-            name: q.longname || q.shortname || q.symbol,
-            url: `https://finance.yahoo.com/quote/${q.symbol}`,
-            exchange: q.exchange,
-            symbol: q.symbol
+            name: q.name || q.symbol,
+            url: `https://www.nasdaq.com/market-activity/stocks/${String(q.symbol || "").toLowerCase()}`,
+            exchange: q.exchange || "US Exchange",
+            symbol: q.symbol,
           }));
-          
-        return res.json({ success: true, data: companies });
+        return res.json({ success: true, data: normalizeCompanySearchResults(companies) });
       }
 
       // Use Screener.in search API for clean company data
@@ -451,7 +1541,7 @@ async function startServer() {
         exchange: "BSE/NSE"
       }));
 
-      res.json({ success: true, data: companies });
+      res.json({ success: true, data: normalizeCompanySearchResults(companies) });
     } catch (error: any) {
       console.error("Error fetching companies:", error.message);
       res.status(500).json({ success: false, error: "Failed to fetch companies" });
@@ -465,62 +1555,28 @@ async function startServer() {
       const { country } = req.query;
       
       if (country === 'US') {
-        // Real-time US scanner results from Yahoo Finance API
-        try {
-          const usScreenerMap: Record<string, string> = {
-            'VALUE_BUYS': 'undervalued_growth_stocks',
-            'QGLP_FRAMEWORK': 'most_watched_tickers',
-            'SMILE_FRAMEWORK': 'small_cap_gainers',
-            'HIGH_ROE_GROWTH': 'growth_technology_stocks',
-            'MULTIBAGGER_SIGNAL': 'aggressive_small_caps',
-            'LOW_ROE_HIGH_GROWTH': 'day_gainers',
-            'STABLE_MED_GROWTH': 'most_actives',
-            'STABLE_LOW_GROWTH': 'day_gainers',
-            'GARP': 'undervalued_growth_stocks'
+        const scannerSeeds: Record<string, string[]> = {
+          VALUE_BUYS: ["BRK.B", "JNJ", "PG", "PEP", "KO", "PFE", "UNH", "CVX"],
+          QGLP_FRAMEWORK: ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "META", "NFLX", "TSM"],
+          SMILE_FRAMEWORK: ["PLTR", "SOFI", "RKLB", "IONQ", "ASTS", "RGTI", "HIMS", "DUOL"],
+          HIGH_ROE_GROWTH: ["MSFT", "NVDA", "AVGO", "ADBE", "INTU", "COST", "MA", "V"],
+          MULTIBAGGER_SIGNAL: ["CRWD", "SNOW", "DDOG", "SHOP", "MELI", "CELH", "ONON", "AXON"],
+          LOW_ROE_HIGH_GROWTH: ["UBER", "ABNB", "SQ", "COIN", "AFRM", "DOCU", "PATH", "AI"],
+          STABLE_MED_GROWTH: ["MSFT", "AAPL", "GOOGL", "V", "MA", "LLY", "COST", "WM"],
+          STABLE_LOW_GROWTH: ["JNJ", "PG", "KO", "PEP", "WMT", "MCD", "HD", "XOM"],
+          GARP: ["AAPL", "MSFT", "AMZN", "META", "CRM", "ORCL", "TXN", "AMD"],
+        };
+        const symbols = scannerSeeds[id] || scannerSeeds.STABLE_MED_GROWTH;
+        const rows = await Promise.all(symbols.map(async (symbol) => {
+          const info = await fetchNasdaqQuoteInfo(symbol);
+          return {
+            id: symbol,
+            name: info?.companyName || symbol,
+            url: `https://www.nasdaq.com/market-activity/stocks/${symbol.toLowerCase()}`,
+            exchange: info?.exchange || "US Exchange",
           };
-          
-          const screenerId = usScreenerMap[id] || 'most_actives';
-          const apiUrl = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${screenerId}&count=25`;
-          
-          console.log(`[Scanner] Fetching US scanner: ${screenerId} from ${apiUrl}`);
-          
-          const response = await fetchWithRetry(apiUrl, {
-            headers: {
-              "Accept": "application/json"
-            },
-            timeout: 10000
-          });
-          
-          const results: any[] = [];
-          const quotes = response.data?.finance?.result?.[0]?.quotes || [];
-          
-          quotes.forEach((quote: any) => {
-            if (quote.symbol) {
-              results.push({
-                id: quote.symbol,
-                name: quote.longName || quote.shortName || quote.symbol,
-                url: `https://finance.yahoo.com/quote/${quote.symbol}`,
-                exchange: quote.fullExchangeName || "US Exchange"
-              });
-            }
-          });
-          
-          if (results.length === 0) {
-            // Fallback to most active if specific screener failed or returned empty
-            return res.json({ success: true, data: [
-              { id: 'AAPL', name: 'Apple Inc.', url: 'https://finance.yahoo.com/quote/AAPL', exchange: 'NASDAQ' },
-              { id: 'MSFT', name: 'Microsoft Corp.', url: 'https://finance.yahoo.com/quote/MSFT', exchange: 'NASDAQ' },
-              { id: 'TSLA', name: 'Tesla, Inc.', url: 'https://finance.yahoo.com/quote/TSLA', exchange: 'NASDAQ' },
-              { id: 'NVDA', name: 'NVIDIA Corporation', url: 'https://finance.yahoo.com/quote/NVDA', exchange: 'NASDAQ' },
-              { id: 'AMZN', name: 'Amazon.com, Inc.', url: 'https://finance.yahoo.com/quote/AMZN', exchange: 'NASDAQ' }
-            ] });
-          }
-
-          return res.json({ success: true, data: results });
-        } catch (usScannerError: any) {
-          console.error("Error fetching US scanner results:", usScannerError.message);
-          return res.status(500).json({ success: false, error: "Failed to fetch US scanner results" });
-        }
+        }));
+        return res.json({ success: true, data: normalizeCompanySearchResults(rows) });
       }
 
       const strategyUrls: Record<string, string> = {
@@ -577,7 +1633,7 @@ async function startServer() {
       }
 
       console.log(`[Scanner] Found ${results.length} companies for ${id}`);
-      res.json({ success: true, data: results.slice(0, 20) });
+      res.json({ success: true, data: normalizeCompanySearchResults(results.slice(0, 20)) });
     } catch (error: any) {
       console.error("Error fetching scanner results:", error.message);
       res.status(500).json({ success: false, error: "Failed to fetch scanner results" });
@@ -588,488 +1644,49 @@ async function startServer() {
   app.get("/api/company/fundamentals", async (req, res) => {
     try {
       const { url, country } = req.query;
+      const reportType = (String(req.query.reportType || "standard").toLowerCase() as ReportType);
+      const normalizedReportType: ReportType = reportType === "deep" || reportType === "quick" ? reportType : "standard";
       if (!url || typeof url !== "string") {
         console.error("[Fundamentals] Missing URL parameter");
         return res.status(400).json({ success: false, error: "URL is required" });
       }
 
       if (country === 'US') {
-        // Extract symbol from Yahoo Finance URL using regex
-        const symbolMatch = url.match(/\/quote\/([^\/\?]+)/);
-        const symbol = symbolMatch ? symbolMatch[1].toUpperCase() : null;
-        
-        if (!symbol) {
-          console.error("[Fundamentals] Could not extract symbol from URL:", url);
-          throw new Error("Invalid Yahoo Finance URL");
-        }
-
-        console.log(`[Fundamentals] Fetching US data for: ${symbol}`);
-        
-        let result;
-        let quoteData;
-        let alpacaData: any = null;
-
-        // Try Alpaca for real-time price and asset info if keys are available
-        if (process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
-          try {
-            console.log(`[Fundamentals] Fetching Alpaca data for: ${symbol} using key ${process.env.ALPACA_API_KEY.substring(0, 5)}...`);
-            const alpacaRes = await axios.get(`https://data.alpaca.markets/v2/stocks/${symbol}/snapshot`, {
-              headers: {
-                'APCA-API-KEY-ID': process.env.ALPACA_API_KEY,
-                'APCA-API-SECRET-KEY': process.env.ALPACA_SECRET_KEY,
-              },
-              timeout: 5000
-            });
-            alpacaData = alpacaRes.data;
-            console.log(`[Fundamentals] Successfully fetched Alpaca snapshot for ${symbol}`);
-          } catch (e: any) {
-            console.warn(`[Fundamentals] Alpaca API failed for ${symbol}:`, e.message);
-          }
-        }
-        
-        // Try multiple Yahoo Finance API endpoints
-        const yahooEndpoints = [
-          `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData,summaryDetail`,
-          `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData,summaryDetail`,
-          `https://query2.finance.yahoo.com/v7/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData,summaryDetail`,
-          `https://query1.finance.yahoo.com/v7/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData,summaryDetail`
-        ];
-
-        for (const endpoint of yahooEndpoints) {
-          try {
-            const response = await fetchWithRetry(endpoint, {
-              headers: { 
-                "Accept": "application/json",
-                "Referer": "https://finance.yahoo.com/"
-              },
-              timeout: 8000
-            });
-            result = response?.data?.quoteSummary?.result?.[0];
-            if (result) {
-              console.log(`[Fundamentals] Successfully fetched from ${endpoint}`);
-              break;
-            }
-          } catch (e: any) {
-            console.warn(`[Fundamentals] Failed to fetch from ${endpoint}:`, e.message);
-          }
-        }
-
-        // Try v6 quote API as fallback for basic stats
-        if (!result) {
-          try {
-            const quoteUrl = `https://query2.finance.yahoo.com/v6/finance/quote?symbols=${symbol}`;
-            const qResponse = await fetchWithRetry(quoteUrl, { timeout: 5000 });
-            quoteData = qResponse.data?.quoteResponse?.result?.[0];
-            if (quoteData) console.log(`[Fundamentals] Successfully fetched from quote API`);
-          } catch (e: any) {
-            console.warn(`[Fundamentals] Failed to fetch from quote API:`, e.message);
-          }
-        }
-
-        if (!result && !quoteData) {
-          console.log(`[Fundamentals] API failed for ${symbol}, attempting scraping fallback...`);
-          try {
-            // Try the main quote page first as it's more likely to be cached/available
-            const scrapeUrl = `https://finance.yahoo.com/quote/${symbol}`;
-            const scrapeResponse = await axios.get(scrapeUrl, {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0"
-              },
-              timeout: 12000
-            });
-            const $ = cheerio.load(scrapeResponse.data);
-            
-            // Yahoo Finance often uses data-field attributes for real-time updates
-            const getVal = (field: string) => $(`fin-streamer[data-field="${field}"]`).first().text().trim();
-            const getTdVal = (label: string) => $(`td:contains("${label}")`).next().text().trim();
-
-            const marketCap = getTdVal("Market Cap") || getVal("marketCap") || "N/A";
-            const currentPrice = getVal("regularMarketPrice") || $('fin-streamer[data-test="qsp-price"]').text().trim() || "N/A";
-            const peRatio = getTdVal("PE Ratio (TTM)") || getVal("trailingPE") || "N/A";
-            const divYield = getTdVal("Forward Dividend & Yield") || getVal("dividendYield") || "N/A";
-
-            if (currentPrice === "N/A" && marketCap === "N/A") {
-              throw new Error("Scraped page returned no data");
-            }
-
-            const fundamentals = [
-              { name: "Market Cap", value: marketCap },
-              { name: "Current Price", value: currentPrice },
-              { name: "Stock P/E", value: peRatio },
-              { name: "Book Value", value: getTdVal("Book Value Per Share") || "N/A" },
-              { name: "Dividend Yield", value: divYield },
-              { name: "ROCE", value: "N/A" },
-              { name: "ROE", value: getTdVal("Return on Equity") || "N/A" },
-              { name: "Face Value", value: "N/A" }
-            ];
-
-            return res.json({
-              success: true,
-              data: {
-                name: symbol,
-                fundamentals,
-                about: `Financial summary for ${symbol} (Scraped from Yahoo Finance).`,
-                recentAnnouncements: []
-              }
-            });
-          } catch (scrapeError: any) {
-            console.error(`[Fundamentals] Yahoo scraping fallback failed for ${symbol}:`, scrapeError.message);
-            
-            // Finviz Fallback
-            try {
-              console.log(`[Fundamentals] Attempting Finviz fallback for ${symbol}...`);
-              const finvizUrl = `https://finviz.com/quote.ashx?t=${symbol}`;
-              const fvResponse = await axios.get(finvizUrl, {
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                  "Accept": "text/html"
-                },
-                timeout: 8000
-              });
-              const $fv = cheerio.load(fvResponse.data);
-              
-              const getFvVal = (label: string) => $fv(`td:contains("${label}")`).next().text().trim();
-              
-              const currentPrice = $fv('.quote-price').first().text().trim() || $fv('span[id^="quote-last"]').text().trim();
-              const marketCap = getFvVal("Market Cap");
-              const peRatio = getFvVal("P/E");
-              const divYield = getFvVal("Dividend %");
-
-              if (currentPrice && currentPrice !== "") {
-                const fundamentals = [
-                  { name: "Market Cap", value: marketCap || "N/A" },
-                  { name: "Current Price", value: currentPrice },
-                  { name: "Stock P/E", value: peRatio || "N/A" },
-                  { name: "Book Value", value: getFvVal("Price/Book") || "N/A" },
-                  { name: "Dividend Yield", value: divYield || "N/A" },
-                  { name: "ROCE", value: "N/A" },
-                  { name: "ROE", value: getFvVal("ROE") || "N/A" },
-                  { name: "Face Value", value: "N/A" }
-                ];
-
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals,
-                    about: `Financial summary for ${symbol} (Scraped from Finviz).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (fvError: any) {
-              console.error(`[Fundamentals] Finviz fallback failed for ${symbol}:`, fvError.message);
-            }
-
-            // MarketWatch Fallback
-            try {
-              console.log(`[Fundamentals] Attempting MarketWatch fallback for ${symbol}...`);
-              const mwUrl = `https://www.marketwatch.com/investing/stock/${symbol}`;
-              const mwResponse = await axios.get(mwUrl, {
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                  "Referer": "https://www.google.com/"
-                },
-                timeout: 10000
-              });
-              const $mw = cheerio.load(mwResponse.data);
-              
-              const currentPrice = $mw('.intraday__price .value').first().text().trim() || $mw('bg-quote[field="last"]').first().text().trim();
-              const marketCap = $mw('li.kv__item:contains("Market Cap")').find('.kv__value').text().trim();
-              const peRatio = $mw('li.kv__item:contains("P/E Ratio")').find('.kv__value').text().trim();
-              const divYield = $mw('li.kv__item:contains("Yield")').find('.kv__value').text().trim();
-
-              if (currentPrice) {
-                const fundamentals = [
-                  { name: "Market Cap", value: marketCap || "N/A" },
-                  { name: "Current Price", value: currentPrice },
-                  { name: "Stock P/E", value: peRatio || "N/A" },
-                  { name: "Book Value", value: "N/A" },
-                  { name: "Dividend Yield", value: divYield || "N/A" },
-                  { name: "ROCE", value: "N/A" },
-                  { name: "ROE", value: "N/A" },
-                  { name: "Face Value", value: "N/A" }
-                ];
-
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals,
-                    about: `Financial summary for ${symbol} (Scraped from MarketWatch).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (mwError: any) {
-              console.error(`[Fundamentals] MarketWatch fallback failed for ${symbol}:`, mwError.message);
-            }
-
-            // Google Finance Fallback
-            try {
-              console.log(`[Fundamentals] Attempting Google Finance fallback for ${symbol}...`);
-              // Try NYSE then NASDAQ
-              const exchanges = ['NYSE', 'NASDAQ'];
-              for (const exch of exchanges) {
-                try {
-                  const gfUrl = `https://www.google.com/finance/quote/${symbol}:${exch}`;
-                  const gfResponse = await axios.get(gfUrl, {
-                    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36" },
-                    timeout: 5000
-                  });
-                  const $gf = cheerio.load(gfResponse.data);
-                  const currentPrice = $gf('.YMlKec.fxKbKc').first().text().trim();
-                  if (currentPrice && currentPrice.includes('$')) {
-                    const getGfVal = (label: string) => $gf(`div:contains("${label}")`).next().text().trim();
-                    const fundamentals = [
-                      { name: "Market Cap", value: getGfVal("Market cap") || "N/A" },
-                      { name: "Current Price", value: currentPrice },
-                      { name: "Stock P/E", value: getGfVal("P/E ratio") || "N/A" },
-                      { name: "Dividend Yield", value: getGfVal("Dividend yield") || "N/A" },
-                      { name: "ROE", value: "N/A" },
-                      { name: "ROCE", value: "N/A" },
-                      { name: "Book Value", value: "N/A" },
-                      { name: "Face Value", value: "N/A" }
-                    ];
-                    return res.json({
-                      success: true,
-                      data: {
-                        name: symbol,
-                        fundamentals,
-                        about: `Financial summary for ${symbol} (Scraped from Google Finance).`,
-                        recentAnnouncements: []
-                      }
-                    });
-                  }
-                } catch (e) {}
-              }
-            } catch (gfError: any) {
-              console.error(`[Fundamentals] Google Finance fallback failed for ${symbol}:`, gfError.message);
-            }
-
-            // Seeking Alpha Fallback
-            try {
-              console.log(`[Fundamentals] Attempting Seeking Alpha fallback for ${symbol}...`);
-              const saUrl = `https://seekingalpha.com/symbol/${symbol}`;
-              const saResponse = await axios.get(saUrl, {
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                  "Accept": "text/html"
-                },
-                timeout: 8000
-              });
-              const $sa = cheerio.load(saResponse.data);
-              
-              const currentPrice = $sa('[data-test-id="symbol-last-price"]').first().text().trim();
-              const marketCap = $sa('div:contains("Market Cap")').next().text().trim();
-              
-              if (currentPrice) {
-                const fundamentals = [
-                  { name: "Market Cap", value: marketCap || "N/A" },
-                  { name: "Current Price", value: currentPrice },
-                  { name: "Stock P/E", value: "N/A" },
-                  { name: "Book Value", value: "N/A" },
-                  { name: "Dividend Yield", value: "N/A" },
-                  { name: "ROCE", value: "N/A" },
-                  { name: "ROE", value: "N/A" },
-                  { name: "Face Value", value: "N/A" }
-                ];
-
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals,
-                    about: `Financial summary for ${symbol} (Scraped from Seeking Alpha).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (saError: any) {
-              console.error(`[Fundamentals] Seeking Alpha fallback failed for ${symbol}:`, saError.message);
-            }
-
-            // CNBC Fallback
-            try {
-              console.log(`[Fundamentals] Attempting CNBC fallback for ${symbol}...`);
-              const cnbcUrl = `https://www.cnbc.com/quotes/${symbol}`;
-              const cnbcRes = await fetchWithRetry(cnbcUrl, { timeout: 8000 });
-              const $cnbc = cheerio.load(cnbcRes?.data);
-              
-              const currentPrice = $cnbc('.QuoteStrip-lastPrice').first().text().trim();
-              if (currentPrice) {
-                const getCnbcVal = (label: string) => $cnbc(`li:contains("${label}")`).find('.Summary-value').text().trim();
-                const fundamentals = [
-                  { name: "Market Cap", value: getCnbcVal("Market Cap") || "N/A" },
-                  { name: "Current Price", value: currentPrice },
-                  { name: "Stock P/E", value: getCnbcVal("P/E Ratio") || "N/A" },
-                  { name: "Dividend Yield", value: getCnbcVal("Yield") || "N/A" },
-                  { name: "ROE", value: "N/A" },
-                  { name: "ROCE", value: "N/A" },
-                  { name: "Book Value", value: "N/A" },
-                  { name: "Face Value", value: "N/A" }
-                ];
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals,
-                    about: `Financial summary for ${symbol} (Scraped from CNBC).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (e: any) {
-              console.error(`[Fundamentals] CNBC fallback failed for ${symbol}:`, e.message);
-            }
-
-            // Barchart Fallback
-            try {
-              console.log(`[Fundamentals] Attempting Barchart fallback for ${symbol}...`);
-              const barchartUrl = `https://www.barchart.com/stocks/quotes/${symbol}/overview`;
-              const bcRes = await fetchWithRetry(barchartUrl, { timeout: 8000 });
-              const $bc = cheerio.load(bcRes?.data);
-              const currentPrice = $bc('.last-change').first().text().split(' ')[0].trim();
-              if (currentPrice && currentPrice !== "") {
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals: [
-                      { name: "Current Price", value: currentPrice },
-                      { name: "Market Cap", value: "N/A" },
-                      { name: "Stock P/E", value: "N/A" },
-                      { name: "Book Value", value: "N/A" },
-                      { name: "Dividend Yield", value: "N/A" },
-                      { name: "ROCE", value: "N/A" },
-                      { name: "ROE", value: "N/A" },
-                      { name: "Face Value", value: "N/A" }
-                    ],
-                    about: `Basic data for ${symbol} (Scraped from Barchart).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (e: any) {}
-
-            // Final Chart API fallback
-            try {
-              console.log(`[Fundamentals] Attempting Final Chart API fallback for ${symbol}...`);
-              const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
-              const chartRes = await fetchWithRetry(chartUrl, { timeout: 5000 });
-              const meta = chartRes?.data?.chart?.result?.[0]?.meta;
-              if (meta) {
-                return res.json({
-                  success: true,
-                  data: {
-                    name: symbol,
-                    fundamentals: [
-                      { name: "Current Price", value: meta.regularMarketPrice?.toString() || "N/A" },
-                      { name: "Market Cap", value: "N/A" },
-                      { name: "Stock P/E", value: "N/A" },
-                      { name: "Book Value", value: "N/A" },
-                      { name: "Dividend Yield", value: "N/A" },
-                      { name: "ROCE", value: "N/A" },
-                      { name: "ROE", value: "N/A" },
-                      { name: "Face Value", value: "N/A" }
-                    ],
-                    about: `Basic data for ${symbol} (Chart API fallback).`,
-                    recentAnnouncements: []
-                  }
-                });
-              }
-            } catch (e) {}
-            
-            // If everything failed, return a 200 with "Data Unavailable" instead of 404
-            // This prevents the UI from showing a hard error
-            return res.json({
-              success: true,
-              data: {
-                name: symbol,
-                fundamentals: [
-                  { name: "Current Price", value: "Data Unavailable" },
-                  { name: "Market Cap", value: "Data Unavailable" },
-                  { name: "Stock P/E", value: "Data Unavailable" },
-                  { name: "Book Value", value: "Data Unavailable" },
-                  { name: "Dividend Yield", value: "Data Unavailable" },
-                  { name: "ROCE", value: "Data Unavailable" },
-                  { name: "ROE", value: "Data Unavailable" },
-                  { name: "Face Value", value: "Data Unavailable" }
-                ],
-                about: `We are currently experiencing high traffic from our data providers for ${symbol}. Please try again in a few minutes.`,
-                recentAnnouncements: []
-              }
-            });
-          }
-        }
-        
-        const stats = result?.defaultKeyStatistics || {};
-        const financial = result?.financialData || {};
-        const detail = result?.summaryDetail || {};
-
-        const currentPrice = alpacaData?.latestTrade?.p?.toString() || 
-                           detail.regularMarketPrice?.fmt || 
-                           quoteData?.regularMarketPrice?.toString() || 
-                           "N/A";
-
+        const symbol = parseUsSymbol(url);
+        if (!symbol) throw new Error("Invalid US symbol or URL");
+        const sec = await fetchUsSecProfileAndSeries(symbol);
+        const quote = await fetchNasdaqQuoteInfo(symbol);
+        const marketCap = quote?.keyStats?.marketCap?.value || "N/A";
+        const currentPriceNum = parseNasdaqMoneyToNumber(quote?.primaryData?.lastSalePrice || quote?.secondaryData?.lastSalePrice);
+        const peRatio = quote?.keyStats?.peRatio?.value || "N/A";
         const fundamentals = [
-          { name: "Market Cap", value: detail.marketCap?.fmt || detail.marketCap?.longFmt || quoteData?.marketCap ? (quoteData.marketCap > 1e12 ? (quoteData.marketCap/1e12).toFixed(2) + 'T' : (quoteData.marketCap/1e9).toFixed(2) + 'B') : "N/A" },
-          { name: "Current Price", value: currentPrice },
-          { name: "Stock P/E", value: detail.trailingPE?.fmt || quoteData?.trailingPE?.toFixed(2) || "N/A" },
-          { name: "Book Value", value: stats.bookValue?.fmt || quoteData?.bookValue?.toFixed(2) || "N/A" },
-          { name: "Dividend Yield", value: detail.dividendYield?.fmt || (quoteData?.trailingAnnualDividendYield ? (quoteData.trailingAnnualDividendYield * 100).toFixed(2) + '%' : "N/A") },
+          { name: "Market Cap", value: marketCap },
+          { name: "Current Price", value: currentPriceNum != null ? currentPriceNum.toFixed(2) : "N/A" },
+          { name: "Stock P/E", value: peRatio },
+          { name: "Book Value", value: "N/A" },
+          { name: "Dividend Yield", value: "N/A" },
           { name: "ROCE", value: "N/A" },
-          { name: "ROE", value: financial.returnOnEquity?.fmt || "N/A" },
-          { name: "Face Value", value: "N/A" }
+          { name: "ROE", value: "N/A" },
+          { name: "Face Value", value: "N/A" },
+          { name: "Latest Annual Revenue (USD)", value: sec.latestAnnualRevenue != null ? (sec.latestAnnualRevenue / 1_000_000).toFixed(2) + " M" : "N/A" },
+          { name: "Latest Annual Net Income (USD)", value: sec.latestAnnualNetIncome != null ? (sec.latestAnnualNetIncome / 1_000_000).toFixed(2) + " M" : "N/A" },
         ];
-
-        // Fetch recent filings for the specific symbol from SEC
-        let recentAnnouncements: any[] = [];
-        try {
-          const secSearchUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${symbol}&type=&dateb=&owner=include&count=10&output=atom`;
-          const secResponse = await fetchWithRetry(secSearchUrl, {
-            headers: {
-              "User-Agent": "MarketIntelligence (valuepicks25@gmail.com)",
-              "Accept-Encoding": "gzip, deflate",
-              "Host": "www.sec.gov"
-            },
-            timeout: 8000
-          });
-          const $sec = cheerio.load(secResponse.data, { xmlMode: true });
-          $sec('entry').each((i, el) => {
-            const entry = $sec(el);
-            const title = entry.find('title').text();
-            recentAnnouncements.push({
-              id: `sec_${symbol}_${i}`,
-              date: entry.find('updated').text(),
-              subject: title,
-              pdfLink: entry.find('link').attr('href'),
-              category: title.split(' - ')[0] || 'Filing'
-            });
-          });
-        } catch (secReportError) {
-          console.error("Error fetching SEC filings for report:", secReportError);
+        const recentAnnouncements = await fetchSecFilingsForTicker(symbol, 10, "sec_fund_");
+        const payload = normalizeCompanyFundamentals({
+          name: sec.companyName || symbol,
+          fundamentals,
+          about: `US fundamentals sourced from SEC EDGAR (companyfacts/submissions) and Nasdaq public quote APIs. CIK: ${sec.cik}.`,
+          recentAnnouncements,
+        });
+        if (!payload) {
+          return res.status(500).json({ success: false, error: "fundamentals_contract_invalid" });
         }
-
-        return res.json({ 
-          success: true, 
-          data: { 
-            name: symbol,
-            fundamentals,
-            about: `Financial summary for ${symbol} listed on ${detail.exchangeName || 'US Exchange'}.`,
-            recentAnnouncements
-          } 
+        return res.json({
+          success: true,
+          data: payload,
         });
       }
+
 
       const targetUrl = url.startsWith("http") ? url : `https://www.screener.in${url}`;
       console.log(`[Fundamentals] Fetching: ${targetUrl}`);
@@ -1119,7 +1736,7 @@ async function startServer() {
 
       // Extract BSE Symbol
       let bseSymbol = null;
-      const pageText = $('body').text();
+      const pageText = response.data;
       const bseMatch = pageText.match(/BSE:\s*(\d{6})/);
       if (bseMatch && bseMatch[1]) {
         bseSymbol = bseMatch[1];
@@ -1130,7 +1747,7 @@ async function startServer() {
         throw new Error("Could not parse company data. The page layout might have changed or access is restricted.");
       }
 
-      let recentAnnouncements: any[] = [];
+      let recentAnnouncements: ReportAnnouncement[] = [];
       try {
         if (bseSymbol) {
           recentAnnouncements = await db.all(
@@ -1149,15 +1766,16 @@ async function startServer() {
       }
 
       console.log(`[Fundamentals] Successfully parsed data for: ${name}`);
-      res.json({ 
-        success: true, 
-        data: { 
-          name, 
-          about, 
-          fundamentals,
-          recentAnnouncements
-        } 
+      const payload = normalizeCompanyFundamentals({
+        name,
+        about,
+        fundamentals,
+        recentAnnouncements,
       });
+      if (!payload) {
+        return res.status(500).json({ success: false, error: "fundamentals_contract_invalid" });
+      }
+      res.json({ success: true, data: payload });
     } catch (error: any) {
       console.error("[Fundamentals] Error:", error.response?.status, error.message);
       const status = error.response?.status || 500;
@@ -1170,221 +1788,68 @@ async function startServer() {
   app.get("/api/company/report", async (req, res) => {
     try {
       const { url, country } = req.query;
+      const reportType = String(req.query.reportType || "standard").toLowerCase();
+      const normalizedReportType: ReportType = reportType === "deep" || reportType === "quick" ? reportType : "standard";
+      const includeAI = String(req.query.includeAI || "true").toLowerCase() !== "false";
       if (!url || typeof url !== "string") {
         return res.status(400).json({ success: false, error: "URL is required" });
       }
 
       if (country === 'US') {
-        const symbolMatch = url.match(/\/quote\/([^\/\?]+)/);
-        const symbol = symbolMatch ? symbolMatch[1].toUpperCase() : null;
-        if (!symbol) throw new Error("Invalid Yahoo Finance URL");
-
-        console.log(`[Report] Fetching US data for: ${symbol}`);
-
-        // Fetch income statement for charts
-        let result;
-        const yahooEndpoints = [
-          `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`,
-          `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`,
-          `https://query2.finance.yahoo.com/v7/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`,
-          `https://query1.finance.yahoo.com/v7/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`
-        ];
-
-        for (const endpoint of yahooEndpoints) {
-          try {
-            const response = await fetchWithRetry(endpoint, {
-              headers: { 
-                "Accept": "application/json",
-                "Referer": "https://finance.yahoo.com/"
-              },
-              timeout: 12000
-            });
-            result = response.data?.quoteSummary?.result?.[0];
-            if (result) {
-              console.log(`[Report] Successfully fetched from ${endpoint}`);
-              break;
-            }
-          } catch (e: any) {
-            console.warn(`[Report] Failed to fetch from ${endpoint}:`, e.message);
-          }
+        const symbol = parseUsSymbol(url);
+        if (!symbol) throw new Error("Invalid US symbol or URL");
+        const sec = await fetchUsSecProfileAndSeries(symbol);
+        const quote = await fetchNasdaqQuoteInfo(symbol);
+        const chartData = sec.annual;
+        const quarterlyData = sec.quarterly;
+        const recentAnnouncements = await fetchSecFilingsForTicker(symbol, 10, "sec_report_");
+        const currentPriceNum = parseNasdaqMoneyToNumber(quote?.primaryData?.lastSalePrice || quote?.secondaryData?.lastSalePrice);
+        const aiReport = includeAI
+          ? await generateAIReport(
+              sec.companyName || symbol,
+              'US',
+              chartData,
+              quarterlyData,
+              recentAnnouncements,
+              currentPriceNum != null ? currentPriceNum.toFixed(2) : "N/A",
+              normalizedReportType,
+            )
+          : "AI generation skipped for validation request.";
+        const payloadRaw: CompanyReportData = {
+          name: sec.companyName || symbol,
+          chartData,
+          quarterlyData,
+          recentAnnouncements,
+          aiReport,
+          reportType: normalizedReportType,
+          summary: {
+            price: currentPriceNum != null ? currentPriceNum.toFixed(2) : "N/A",
+            marketCap: quote?.keyStats?.marketCap?.value || "N/A",
+            pe: quote?.keyStats?.peRatio?.value || "N/A",
+            source: "SEC EDGAR + Nasdaq public APIs",
+          },
+        };
+        const payload = normalizeCompanyReportData(payloadRaw);
+        if (!payload) {
+          return res.status(500).json({ success: false, error: "report_contract_invalid" });
         }
-        
-        if (!result) {
-          console.log(`[Report] API failed for ${symbol}, attempting Summary fallback...`);
-          try {
-            // Try to get at least summary data if financials fail
-            const summaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=summaryDetail,defaultKeyStatistics,financialData`;
-            const summaryRes = await fetchWithRetry(summaryUrl, { timeout: 8000 });
-            const summaryResult = summaryRes?.data?.quoteSummary?.result?.[0];
-            
-            if (summaryResult) {
-              const detail = summaryResult.summaryDetail || {};
-              const stats = summaryResult.defaultKeyStatistics || {};
-              const financial = summaryResult.financialData || {};
-              
-              const chartData = [{
-                year: new Date().getFullYear().toString(),
-                sales: detail.totalRevenue?.fmt || financial.totalRevenue?.fmt || "N/A",
-                netProfit: financial.netIncome?.fmt || "N/A",
-                eps: stats.trailingEps?.fmt || "N/A"
-              }];
-
-              return res.json({
-                success: true,
-                data: {
-                  name: symbol,
-                  chartData,
-                  quarterlyData: [],
-                  recentAnnouncements: [],
-                  summary: {
-                    price: financial.currentPrice?.fmt || "N/A",
-                    marketCap: detail.marketCap?.fmt || "N/A",
-                    pe: detail.trailingPE?.fmt || "N/A"
-                  }
-                }
-              });
-            }
-          } catch (e: any) {
-            console.error(`[Report] Summary fallback failed for ${symbol}:`, e.message);
-          }
-
-          console.log(`[Report] API failed for ${symbol}, attempting Chart API fallback...`);
-          try {
-            const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=3mo&range=5y`;
-            const chartRes = await fetchWithRetry(chartUrl, { timeout: 8000 });
-            const chartResult = chartRes?.data?.chart?.result?.[0];
-            if (chartResult && chartResult.indicators?.quote?.[0]) {
-              const timestamps = chartResult.timestamp || [];
-              const sales = chartResult.indicators.quote[0].close || []; 
-              
-              const chartData = timestamps.slice(-5).map((ts: number, i: number) => ({
-                year: new Date(ts * 1000).getFullYear().toString(),
-                sales: (sales[timestamps.length - 5 + i] || 0).toFixed(2),
-                netProfit: "0.00",
-                eps: "N/A"
-              }));
-
-              return res.json({
-                success: true,
-                data: {
-                  name: symbol,
-                  chartData,
-                  quarterlyData: [],
-                  recentAnnouncements: []
-                }
-              });
-            }
-          } catch (e: any) {
-            console.error(`[Report] Chart API fallback failed for ${symbol}:`, e.message);
-          }
-
-          console.log(`[Report] API failed for ${symbol}, attempting scraping fallback...`);
-          try {
-            const scrapeUrl = `https://finance.yahoo.com/quote/${symbol}/financials`;
-            const scrapeResponse = await fetchWithRetry(scrapeUrl, { timeout: 15000 });
-            const $ = cheerio.load(scrapeResponse.data);
-            
-            // Try to find the financial data in the script tag (Yahoo stores it in a large JSON object)
-            const scriptContent = $('script:contains("root.App.main")').text();
-            if (scriptContent) {
-              const jsonMatch = scriptContent.match(/root\.App\.main\s*=\s*({.*?});/);
-              if (jsonMatch && jsonMatch[1]) {
-                const fullData = JSON.parse(jsonMatch[1]);
-                const financials = fullData.context?.dispatcher?.stores?.QuoteSummaryStore?.incomeStatementHistory?.incomeStatementHistory || [];
-                const qFinancials = fullData.context?.dispatcher?.stores?.QuoteSummaryStore?.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
-                
-                if (financials.length > 0) {
-                  const chartData = financials.map((item: any) => ({
-                    year: item.endDate?.fmt?.split('-')[0] || "N/A",
-                    sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00",
-                    netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00",
-                    eps: "N/A"
-                  })).reverse();
-
-                  const quarterlyData = qFinancials.map((item: any) => ({
-                    quarter: item.endDate?.fmt || "N/A",
-                    sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00",
-                    netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00",
-                    eps: "N/A"
-                  })).reverse();
-
-                  return res.json({
-                    success: true,
-                    data: {
-                      name: symbol,
-                      chartData,
-                      quarterlyData,
-                      recentAnnouncements: []
-                    }
-                  });
-                }
-              }
-            }
-            throw new Error("Could not extract financial data from scraped page");
-          } catch (scrapeError: any) {
-            console.error(`[Report] Scraping fallback failed for ${symbol}:`, scrapeError.message);
-            return res.status(404).json({ success: false, error: `No data found for symbol: ${symbol}. Yahoo Finance API might be temporarily restricted.` });
-          }
+        const latestAnnouncementDate = recentAnnouncements[0]?.date ? new Date(recentAnnouncements[0].date).toISOString() : null;
+        const qualityGate = assessReportQuality(payload, latestAnnouncementDate);
+        if (!isQualityGateResult(qualityGate)) {
+          return res.status(500).json({ success: false, error: "quality_gate_contract_invalid" });
         }
-        
-        const annual = result.incomeStatementHistory?.incomeStatementHistory || [];
-        const quarterly = result.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
-        const stats = result.defaultKeyStatistics || {};
-        const name = symbol;
-
-        const chartData = annual.map((item: any) => ({
-          year: item.endDate?.raw ? new Date(item.endDate.raw * 1000).getFullYear().toString() : "N/A",
-          sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00", // In Millions
-          netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00",
-          eps: item.trailingEps?.fmt || stats.trailingEps?.fmt || "N/A"
-        })).reverse();
-
-        const quarterlyData = quarterly.map((item: any) => ({
-          quarter: item.endDate?.raw ? new Date(item.endDate.raw * 1000).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }) : "N/A",
-          sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00",
-          netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00",
-          eps: item.trailingEps?.fmt || "N/A"
-        })).reverse();
-
-        // Fetch recent filings for the specific symbol from SEC
-        let recentAnnouncements: any[] = [];
-        try {
-          const secSearchUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${symbol}&type=&dateb=&owner=include&count=10&output=atom`;
-          const secResponse = await fetchWithRetry(secSearchUrl, {
-            headers: {
-              "User-Agent": "MarketIntelligence (valuepicks25@gmail.com)",
-              "Accept-Encoding": "gzip, deflate",
-              "Host": "www.sec.gov"
-            },
-            timeout: 8000
+        if (qualityGate.passed) {
+          await saveGeneratedReport({
+            companyName: sec.companyName || symbol,
+            symbol,
+            country: "US",
+            sourceUrl: url,
+            report: payload,
           });
-          const $sec = cheerio.load(secResponse.data, { xmlMode: true });
-          $sec('entry').each((i, el) => {
-            const entry = $sec(el);
-            recentAnnouncements.push({
-              id: `sec_report_${symbol}_${i}`,
-              date: entry.find('updated').text(),
-              subject: entry.find('title').text(),
-              pdfLink: entry.find('link').attr('href')
-            });
-          });
-        } catch (secReportError) {
-          console.error("Error fetching SEC filings for report:", secReportError);
         }
-
-        const aiReport = await generateAIReport(name, 'US', chartData, quarterlyData, recentAnnouncements);
-
-        return res.json({ 
-          success: true, 
-          data: { 
-            name,
-            chartData,
-            quarterlyData,
-            recentAnnouncements,
-            aiReport
-          } 
-        });
+        return res.json({ success: true, data: payload, qualityGate });
       }
+
 
       const targetUrl = url.startsWith("http") ? url : `https://www.screener.in${url}`;
       
@@ -1417,89 +1882,20 @@ async function startServer() {
         throw new Error("Invalid or empty response from Screener.in");
       }
 
-      const $ = cheerio.load(response.data);
-      const name = $('h1.show-from-tablet-landscape').text().trim() || $('h1').first().text().trim();
-      
-      // Parse Profit & Loss Table
-      const plSection = $('#profit-loss');
-      const years: string[] = [];
-      const sales: number[] = [];
-      const netProfit: number[] = [];
-      const eps: number[] = [];
-
-      plSection.find('thead th').each((i, el) => {
-        if (i > 0) years.push($(el).text().trim());
-      });
-
-      plSection.find('tbody tr').each((_, tr) => {
-        const rowName = $(tr).find('td').first().text().trim();
-        if (rowName.includes('Sales')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) sales.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        } else if (rowName.includes('Net Profit')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) netProfit.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        } else if (rowName.includes('EPS in Rs')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) eps.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        }
-      });
-
-      // Format data for charts
-      const chartData = years.map((year, i) => ({
-        year,
-        sales: sales[i] || 0,
-        netProfit: netProfit[i] || 0,
-        eps: eps[i] || 0
-      }));
-
-      // Parse Quarterly Results
-      const quartersSection = $('#quarters');
-      const quarterNames: string[] = [];
-      const qSales: number[] = [];
-      const qNetProfit: number[] = [];
-      const qEps: number[] = [];
-
-      quartersSection.find('thead th').each((i, el) => {
-        if (i > 0) quarterNames.push($(el).text().trim());
-      });
-
-      quartersSection.find('tbody tr').each((_, tr) => {
-        const rowName = $(tr).find('td').first().text().trim();
-        if (rowName.includes('Sales')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) qSales.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        } else if (rowName.includes('Net Profit')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) qNetProfit.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        } else if (rowName.includes('EPS in Rs')) {
-          $(tr).find('td').each((i, td) => {
-            if (i > 0) qEps.push(parseFloat($(td).text().replace(/,/g, '')) || 0);
-          });
-        }
-      });
-
-      const quarterlyData = quarterNames.map((quarter, i) => ({
-        quarter,
-        sales: qSales[i] || 0,
-        netProfit: qNetProfit[i] || 0,
-        eps: qEps[i] || 0
-      }));
+      const parsed = parseScreenerFinancials(response.data);
+      const name = parsed.name;
+      const chartData = parsed.chartData;
+      const quarterlyData = parsed.quarterlyData;
 
       // Extract BSE Symbol and fetch recent announcements
       let bseSymbol = null;
-      const pageText = $('body').text();
+      const pageText = response.data;
       const bseMatch = pageText.match(/BSE:\s*(\d{6})/);
       if (bseMatch && bseMatch[1]) {
         bseSymbol = bseMatch[1];
       }
 
-      let recentAnnouncements: any[] = [];
+      let recentAnnouncements: ReportAnnouncement[] = [];
       try {
         if (bseSymbol) {
           recentAnnouncements = await db.all(
@@ -1517,23 +1913,95 @@ async function startServer() {
         console.error("Error fetching recent announcements for report:", dbErr);
       }
 
-      const aiReport = await generateAIReport(name, 'IN', chartData, quarterlyData, recentAnnouncements);
+      const aiReport = includeAI
+        ? await generateAIReport(
+            name,
+            'IN',
+            chartData,
+            quarterlyData,
+            recentAnnouncements,
+            "N/A",
+            normalizedReportType,
+          )
+        : "AI generation skipped for validation request.";
 
-      res.json({ 
-        success: true, 
-        data: { 
-          name,
-          chartData,
-          quarterlyData,
-          recentAnnouncements,
-          aiReport
-        } 
-      });
+      const payloadRaw: CompanyReportData = {
+        name,
+        chartData,
+        quarterlyData,
+        recentAnnouncements,
+        aiReport,
+        reportType: normalizedReportType,
+        parsingWarnings: parsed.parsingWarnings,
+      };
+      const payload = normalizeCompanyReportData(payloadRaw);
+      if (!payload) {
+        return res.status(500).json({ success: false, error: "report_contract_invalid" });
+      }
+      const latestAnnouncementDate = recentAnnouncements[0]?.date || null;
+      const qualityGate = assessReportQuality(payload, latestAnnouncementDate);
+      if (!isQualityGateResult(qualityGate)) {
+        return res.status(500).json({ success: false, error: "quality_gate_contract_invalid" });
+      }
+      if (parsed.parsingWarnings.length) {
+        qualityGate.missingComponents.push(...parsed.parsingWarnings);
+      }
+      if (qualityGate.passed) {
+        await saveGeneratedReport({
+          companyName: name,
+          symbol: bseSymbol || null,
+          country: "IN",
+          sourceUrl: targetUrl,
+          report: payload,
+        });
+      }
+      res.json({ success: true, data: payload, qualityGate });
     } catch (error: any) {
       console.error("[Report] Error:", error.response?.status, error.message);
       const status = error.response?.status || 500;
       const message = error.response?.data?.error || error.message || "Failed to generate report";
       res.status(status).json({ success: false, error: message });
+    }
+  });
+
+  app.get("/api/company/price-history", async (req, res) => {
+    try {
+      const { url, country, symbol } = req.query;
+      if (!url || typeof url !== "string") {
+        return res.status(400).json({ success: false, error: "URL is required" });
+      }
+
+      let resolvedSymbol: string | null = null;
+      if (country === "US") {
+        const hinted = typeof symbol === "string" ? symbol.trim().toUpperCase() : "";
+        if (hinted) resolvedSymbol = hinted;
+        else {
+          resolvedSymbol = parseUsSymbol(url);
+        }
+      } else {
+        resolvedSymbol = resolveIndianExchangeSymbol(url, typeof symbol === "string" ? symbol : null);
+      }
+
+      if (!resolvedSymbol) {
+        return res.status(404).json({ success: false, error: "Could not resolve quote symbol for price history" });
+      }
+
+      const candles = country === "US"
+        ? await fetchNasdaqDailyHistory(resolvedSymbol, format(subDays(new Date(), 365 * 5), "yyyy-MM-dd"))
+        : await fetchIndianDailySeriesFromExchanges(resolvedSymbol, format(subDays(new Date(), 365 * 5), "yyyy-MM-dd"));
+      const payload = normalizePriceHistoryData({
+        symbol: resolvedSymbol,
+        candles,
+      });
+      if (!payload) {
+        return res.status(500).json({ success: false, error: "price_history_contract_invalid" });
+      }
+      return res.json({ success: true, data: payload });
+    } catch (error: any) {
+      console.error("[PriceHistory] Error:", error.response?.status, error.message);
+      const status = error.response?.status || 500;
+      const message = error.response?.data?.error || error.message || "Failed to fetch price history";
+      return res.status(status).json({ success: false, error: message });
     }
   });
 
@@ -1548,61 +2016,23 @@ async function startServer() {
       // We'll reuse the logic from /api/company/report but only return the snapshot
       
       let name = "";
-      let chartData: any[] = [];
-      let quarterlyData: any[] = [];
-      let recentAnnouncements: any[] = [];
+      let chartData: ReportChartRow[] = [];
+      let quarterlyData: ReportQuarterlyRow[] = [];
+      let recentAnnouncements: ReportAnnouncement[] = [];
 
       if (country === 'US') {
-        const symbolMatch = url.match(/\/quote\/([^\/\?]+)/);
-        const symbol = symbolMatch ? symbolMatch[1].toUpperCase() : null;
-        if (!symbol) throw new Error("Invalid Yahoo Finance URL");
-
-        name = symbol;
-
-        // Try to fetch from Yahoo API
-        let result;
-        const yahooEndpoints = [
-          `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`,
-          `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=incomeStatementHistory,incomeStatementHistoryQuarterly,summaryDetail`
-        ];
-
-        for (const endpoint of yahooEndpoints) {
-          try {
-            const response = await fetchWithRetry(endpoint, { timeout: 8000 });
-            result = response.data?.quoteSummary?.result?.[0];
-            if (result) break;
-          } catch (e) {}
-        }
-
-        if (result) {
-          const annual = result.incomeStatementHistory?.incomeStatementHistory || [];
-          const quarterly = result.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
-          
-          chartData = annual.map((item: any) => ({
-            year: item.endDate?.raw ? new Date(item.endDate.raw * 1000).getFullYear().toString() : "N/A",
-            sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00",
-            netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00"
-          })).reverse();
-
-          quarterlyData = quarterly.map((item: any) => ({
-            quarter: item.endDate?.raw ? new Date(item.endDate.raw * 1000).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }) : "N/A",
-            sales: item.totalRevenue?.raw ? (item.totalRevenue.raw / 1000000).toFixed(2) : "0.00",
-            netProfit: item.netIncome?.raw ? (item.netIncome.raw / 1000000).toFixed(2) : "0.00"
-          })).reverse();
-        }
-
-        // Fetch SEC filings
+        const symbol = parseUsSymbol(url);
+        if (!symbol) throw new Error("Invalid US symbol or URL");
+        const sec = await fetchUsSecProfileAndSeries(symbol);
+        name = sec.companyName || symbol;
+        chartData = sec.annual;
+        quarterlyData = sec.quarterly;
         try {
-          const secSearchUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${symbol}&type=&dateb=&owner=include&count=5&output=atom`;
-          const secResponse = await fetchWithRetry(secSearchUrl, {
-            headers: { "User-Agent": "MarketIntelligence (valuepicks25@gmail.com)" },
-            timeout: 5000
-          });
-          const $sec = cheerio.load(secResponse.data, { xmlMode: true });
-          $sec('entry').each((i, el) => {
-            recentAnnouncements.push({ subject: $sec(el).find('title').text() });
-          });
-        } catch (e) {}
+          recentAnnouncements = await fetchSecFilingsForTicker(symbol, 5, "sec_snap_");
+        } catch (e: any) {
+          console.warn("[Snapshot] SEC filings:", e.message);
+        }
+
 
       } else {
         // India logic
@@ -1611,42 +2041,10 @@ async function startServer() {
           headers: { "User-Agent": USER_AGENTS[0] },
           timeout: 10000
         });
-        const $ = cheerio.load(response.data);
-        name = $('h1').first().text().trim();
-
-        const plSection = $('#profit-loss');
-        const years: string[] = [];
-        const sales: number[] = [];
-        const netProfit: number[] = [];
-
-        plSection.find('thead th').each((i, el) => { if (i > 0) years.push($(el).text().trim()); });
-        plSection.find('tbody tr').each((_, tr) => {
-          const rowName = $(tr).find('td').first().text().trim();
-          if (rowName.includes('Sales')) {
-            $(tr).find('td').each((i, td) => { if (i > 0) sales.push(parseFloat($(td).text().replace(/,/g, '')) || 0); });
-          } else if (rowName.includes('Net Profit')) {
-            $(tr).find('td').each((i, td) => { if (i > 0) netProfit.push(parseFloat($(td).text().replace(/,/g, '')) || 0); });
-          }
-        });
-
-        chartData = years.map((year, i) => ({ year, sales: sales[i] || 0, netProfit: netProfit[i] || 0 }));
-
-        const quartersSection = $('#quarters');
-        const quarterNames: string[] = [];
-        const qSales: number[] = [];
-        const qNetProfit: number[] = [];
-
-        quartersSection.find('thead th').each((i, el) => { if (i > 0) quarterNames.push($(el).text().trim()); });
-        quartersSection.find('tbody tr').each((_, tr) => {
-          const rowName = $(tr).find('td').first().text().trim();
-          if (rowName.includes('Sales')) {
-            $(tr).find('td').each((i, td) => { if (i > 0) qSales.push(parseFloat($(td).text().replace(/,/g, '')) || 0); });
-          } else if (rowName.includes('Net Profit')) {
-            $(tr).find('td').each((i, td) => { if (i > 0) qNetProfit.push(parseFloat($(td).text().replace(/,/g, '')) || 0); });
-          }
-        });
-
-        quarterlyData = quarterNames.map((quarter, i) => ({ quarter, sales: qSales[i] || 0, netProfit: qNetProfit[i] || 0 }));
+        const parsed = parseScreenerFinancials(response.data);
+        name = parsed.name;
+        chartData = parsed.chartData;
+        quarterlyData = parsed.quarterlyData;
 
         // BSE Announcements
         const bseMatch = response.data.match(/BSE:\s*(\d{6})/);
@@ -1659,11 +2057,572 @@ async function startServer() {
       }
 
       const snapshot = await generateQuickSnapshot(name, country as string, chartData, quarterlyData, recentAnnouncements);
-      res.json({ success: true, data: { name, snapshot } });
+      const snapshotPayload = { name, snapshot };
+      if (!isCompanySnapshotData(snapshotPayload)) {
+        return res.status(500).json({ success: false, error: "snapshot_contract_invalid" });
+      }
+      res.json({ success: true, data: snapshotPayload });
 
     } catch (error: any) {
       console.error("[Snapshot] Error:", error.message);
       res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  app.get("/api/strategy-portfolios", (_req, res) => {
+    res.json({ success: true, data: STRATEGY_PORTFOLIOS });
+  });
+
+  app.get("/api/strategy-portfolio/performance", async (req, res) => {
+    try {
+      const startDate = req.query.startDate as string | undefined;
+      const symbolsParam = req.query.symbols as string | undefined;
+      if (!startDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+        return res.status(400).json({ success: false, error: "Query startDate=YYYY-MM-DD is required" });
+      }
+      if (!symbolsParam?.trim()) {
+        return res.status(400).json({ success: false, error: "Query symbols is required (comma-separated symbols)" });
+      }
+      const symbols = symbolsParam.split(",").map((s) => s.trim()).filter(Boolean);
+      if (symbols.length > 48) {
+        return res.status(400).json({ success: false, error: "Too many symbols (max 48)" });
+      }
+
+      const rows: Array<any> = [];
+      for (const symbol of symbols) {
+        const cached = await db.get("SELECT payloadJson FROM strategy_perf_cache WHERE symbol = ? AND startDate = ?", [symbol, startDate]);
+        if (cached?.payloadJson) {
+          rows.push(JSON.parse(cached.payloadJson));
+          continue;
+        }
+        try {
+          const isIndian = /\.NS$|\.BO$/i.test(symbol);
+          const candles = isIndian
+            ? await fetchIndianDailySeriesFromExchanges(symbol, format(subDays(new Date(startDate), 14), "yyyy-MM-dd"))
+            : await fetchNasdaqDailyHistory(symbol, format(subDays(new Date(startDate), 14), "yyyy-MM-dd"));
+          const closes: Array<number | null> = candles.map((c) => c.close);
+          let entryIdx = -1;
+          for (let i = 0; i < candles.length; i++) {
+            const d = candles[i].date;
+            const c = closes[i];
+            if (c != null && Number.isFinite(c) && d >= startDate) { entryIdx = i; break; }
+          }
+          let lastIdx = -1;
+          for (let i = closes.length - 1; i >= 0; i--) {
+            const c = closes[i];
+            if (c != null && Number.isFinite(c)) { lastIdx = i; break; }
+          }
+          if (entryIdx < 0 || lastIdx < 0) {
+            const out = { symbol, entryDate: null, entryPrice: null, lastDate: null, lastPrice: null, returnPct: null, error: "no_data" };
+            rows.push(out);
+            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+          } else {
+            const entryPrice = Number(closes[entryIdx]);
+            const lastPrice = Number(closes[lastIdx]);
+            const out = {
+              symbol,
+              entryDate: candles[entryIdx].date,
+              entryPrice,
+              lastDate: candles[lastIdx].date,
+              lastPrice,
+              returnPct: entryPrice > 0 ? ((lastPrice / entryPrice) - 1) * 100 : null,
+            };
+            rows.push(out);
+            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+          }
+        } catch (e: any) {
+          const out = { symbol, entryDate: null, entryPrice: null, lastDate: null, lastPrice: null, returnPct: null, error: e.message || "fetch_failed" };
+          rows.push(out);
+          await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+        }
+      }
+      const ok = rows.filter((r) => r.returnPct != null);
+      const equalWeightReturnPct = ok.length ? ok.reduce((sum, r) => sum + r.returnPct, 0) / ok.length : null;
+      res.json({
+        success: true,
+        data: {
+          startDate,
+          timezoneNote: "Entry price uses first available daily close on/after selected date (IST date input).",
+          asOf: new Date().toISOString(),
+          equalWeightReturnPct,
+          countOk: ok.length,
+          countTotal: rows.length,
+          symbols: rows,
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "performance_failed" });
+    }
+  });
+
+  app.get("/api/reports/saved", async (req, res) => {
+    try {
+      const { country, symbol, limit = "50" } = req.query as Record<string, string>;
+      const where: string[] = [];
+      const params: any[] = [];
+      if (country) {
+        where.push("country = ?");
+        params.push(country);
+      }
+      if (symbol) {
+        where.push("symbol = ?");
+        params.push(symbol);
+      }
+      const lim = Math.min(200, Math.max(1, Number(limit) || 50));
+      const query = `
+        SELECT id, companyName, symbol, country, sourceUrl, createdAt
+        FROM saved_reports
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY datetime(createdAt) DESC
+        LIMIT ${lim}
+      `;
+      const rows = await db.all(query, params);
+      res.json({ success: true, data: normalizeSavedReportList(rows) });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "failed_to_list_saved_reports" });
+    }
+  });
+
+  app.get("/api/reports/saved/:id", async (req, res) => {
+    try {
+      const row = await db.get("SELECT * FROM saved_reports WHERE id = ?", [req.params.id]);
+      if (!row) return res.status(404).json({ success: false, error: "report_not_found" });
+      const detail = normalizeSavedReportDetail({
+        id: row.id,
+        companyName: row.companyName,
+        symbol: row.symbol,
+        country: row.country,
+        sourceUrl: row.sourceUrl,
+        createdAt: row.createdAt,
+        report: JSON.parse(row.reportJson),
+      });
+      if (!detail) {
+        return res.status(500).json({ success: false, error: "saved_report_contract_invalid" });
+      }
+      res.json({
+        success: true,
+        data: detail,
+      });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "failed_to_get_saved_report" });
+    }
+  });
+
+  app.get("/api/reports/score/:id", async (req, res) => {
+    try {
+      const row = await db.get<{ reportJson: string; createdAt: string; country: string }>(
+        "SELECT reportJson, createdAt, country FROM saved_reports WHERE id = ?",
+        [req.params.id]
+      );
+      if (!row) return res.status(404).json({ success: false, error: "report_not_found" });
+      const parsed = normalizeCompanyReportData(JSON.parse(row.reportJson));
+      const quality = assessReportQuality(parsed, parsed.recentAnnouncements?.[0]?.date || null);
+      const scorecard = buildReportScorecard(parsed, quality);
+      return res.json({
+        success: true,
+        data: {
+          reportId: Number(req.params.id),
+          country: row.country,
+          createdAt: row.createdAt,
+          quality,
+          scorecard,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "score_failed" });
+    }
+  });
+
+  app.post("/api/reports/outcomes/refresh", requireAdmin, async (req, res) => {
+    try {
+      const runAsync = String(req.body?.async || "true") !== "false";
+      const payload = {
+        country: String(req.body?.country || "").trim().toUpperCase(),
+        horizons: Array.isArray(req.body?.horizons) ? req.body.horizons : [30, 90, 180],
+        limit: Number(req.body?.limit || 120),
+      };
+      if (!runAsync) {
+        const result = await refreshOutcomes(payload);
+        return res.json({ success: true, data: result });
+      }
+      const jobId = `out_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const job: OutcomeRefreshJob = {
+        id: jobId,
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: null,
+        status: "queued",
+        input: {
+          country: payload.country,
+          horizons: payload.horizons.map((h: unknown) => Number(h)).filter((n) => Number.isFinite(n) && n > 0),
+          limit: Math.min(300, Math.max(1, Number(payload.limit || 120))),
+        },
+      };
+      outcomeJobs.set(jobId, job);
+      outcomeQueue.push(jobId);
+      metrics.queueEnqueued += 1;
+      void drainOutcomeQueue();
+      return res.status(202).json({ success: true, data: { jobId, status: "queued" } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "refresh_outcomes_failed" });
+    }
+  });
+
+  app.get("/api/reports/outcomes/jobs/:jobId", requireAdmin, (req, res) => {
+    const job = outcomeJobs.get(String(req.params.jobId || ""));
+    if (!job) return res.status(404).json({ success: false, error: "job_not_found" });
+    return res.json({ success: true, data: job });
+  });
+
+  app.get("/api/reports/outcomes", async (req, res) => {
+    try {
+      const country = String(req.query.country || "").trim().toUpperCase();
+      const horizonDays = Number(req.query.horizonDays || 90);
+      if (!Number.isFinite(horizonDays) || horizonDays <= 0) {
+        return res.status(400).json({ success: false, error: "horizonDays must be a positive number" });
+      }
+      const rows: Array<{ returnPct: number | null; status: string; country: string }> = await db.all(
+        `SELECT returnPct, status, country
+         FROM report_outcomes
+         WHERE horizonDays = ?
+         ${country ? "AND country = ?" : ""}`,
+        country ? [horizonDays, country] : [horizonDays]
+      );
+      const usable = rows.filter((r) => r.status === "ok" && r.returnPct != null);
+      const hitRatePct = usable.length
+        ? (usable.filter((r) => Number(r.returnPct) > 0).length / usable.length) * 100
+        : null;
+      const avgReturnPct = usable.length
+        ? usable.reduce((s, r) => s + Number(r.returnPct), 0) / usable.length
+        : null;
+      return res.json({
+        success: true,
+        data: {
+          horizonDays,
+          country: country || "ALL",
+          totalRows: rows.length,
+          usableRows: usable.length,
+          hitRatePct,
+          avgReturnPct,
+          asOf: new Date().toISOString(),
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "outcomes_failed" });
+    }
+  });
+
+  app.get("/api/company/thesis", async (req, res) => {
+    try {
+      const symbol = String(req.query.symbol || "").trim().toUpperCase();
+      const country = String(req.query.country || "IN").trim().toUpperCase() === "US" ? "US" : "IN";
+      if (!symbol) return res.status(400).json({ success: false, error: "symbol_required" });
+      const row = await db.get<{
+        symbol: string;
+        country: string;
+        thesis: string;
+        invalidationTriggersJson: string;
+        status: string;
+        invalidatedReason: string | null;
+        invalidatedAt: string | null;
+        updatedAt: string;
+      }>(
+        `SELECT symbol, country, thesis, invalidationTriggersJson, status, invalidatedReason, invalidatedAt, updatedAt
+         FROM company_thesis_memory WHERE symbol = ? AND country = ?`,
+        [symbol, country]
+      );
+      if (!row) return res.status(404).json({ success: false, error: "thesis_not_found" });
+      return res.json({
+        success: true,
+        data: {
+          symbol: row.symbol,
+          country: row.country,
+          thesis: row.thesis,
+          invalidationTriggers: JSON.parse(row.invalidationTriggersJson || "[]"),
+          status: row.status,
+          invalidatedReason: row.invalidatedReason,
+          invalidatedAt: row.invalidatedAt,
+          updatedAt: row.updatedAt,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "thesis_fetch_failed" });
+    }
+  });
+
+  app.post("/api/company/thesis", requireAdmin, async (req, res) => {
+    try {
+      const symbol = String(req.body?.symbol || "").trim().toUpperCase();
+      const country = String(req.body?.country || "IN").trim().toUpperCase() === "US" ? "US" : "IN";
+      const thesis = String(req.body?.thesis || "").trim();
+      const triggers = Array.isArray(req.body?.invalidationTriggers)
+        ? req.body.invalidationTriggers.map((t: unknown) => String(t).trim()).filter(Boolean)
+        : [];
+      if (!symbol || !thesis) return res.status(400).json({ success: false, error: "symbol_and_thesis_required" });
+      await db.run(
+        `INSERT INTO company_thesis_memory
+         (symbol, country, thesis, invalidationTriggersJson, status, invalidatedReason, invalidatedAt, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?, ?)
+         ON CONFLICT(symbol, country) DO UPDATE SET
+           thesis=excluded.thesis,
+           invalidationTriggersJson=excluded.invalidationTriggersJson,
+           status='active',
+           invalidatedReason=NULL,
+           invalidatedAt=NULL,
+           updatedAt=excluded.updatedAt`,
+        [symbol, country, thesis, JSON.stringify(triggers), new Date().toISOString(), new Date().toISOString()]
+      );
+      return res.json({ success: true, data: { symbol, country, thesis, invalidationTriggers: triggers } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "thesis_save_failed" });
+    }
+  });
+
+  app.post("/api/company/thesis/invalidate", requireAdmin, async (req, res) => {
+    try {
+      const symbol = String(req.body?.symbol || "").trim().toUpperCase();
+      const country = String(req.body?.country || "IN").trim().toUpperCase() === "US" ? "US" : "IN";
+      const reason = String(req.body?.reason || "manual_invalidation").trim();
+      if (!symbol) return res.status(400).json({ success: false, error: "symbol_required" });
+      const updated = await db.run(
+        `UPDATE company_thesis_memory
+         SET status = 'invalidated', invalidatedReason = ?, invalidatedAt = ?, updatedAt = ?
+         WHERE symbol = ? AND country = ?`,
+        [reason, new Date().toISOString(), new Date().toISOString(), symbol, country]
+      );
+      if (!updated.changes) return res.status(404).json({ success: false, error: "thesis_not_found" });
+      return res.json({ success: true, data: { symbol, country, reason } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "thesis_invalidate_failed" });
+    }
+  });
+
+  app.post("/api/portfolio/position-sizing", async (req, res) => {
+    try {
+      const capital = Number(req.body?.capital || 0);
+      const riskBudgetPct = Number(req.body?.riskBudgetPct || 1);
+      const stopLossPct = Number(req.body?.stopLossPct || 8);
+      const candidates = Array.isArray(req.body?.candidates)
+        ? req.body.candidates.map((c: unknown) => ({
+            symbol: String((c as Record<string, unknown>)?.symbol || "").trim().toUpperCase(),
+            score: Number((c as Record<string, unknown>)?.score || 50),
+          })).filter((c: { symbol: string; score: number }) => c.symbol)
+        : [];
+      if (!Number.isFinite(capital) || capital <= 0 || !candidates.length) {
+        return res.status(400).json({ success: false, error: "invalid_position_sizing_input" });
+      }
+      const cappedRiskBudgetPct = Math.min(5, Math.max(0.25, riskBudgetPct));
+      const cappedStopLossPct = Math.min(25, Math.max(2, stopLossPct));
+      const totalRiskCapital = capital * (cappedRiskBudgetPct / 100);
+      const scoreSum = candidates.reduce((s: number, c: { score: number }) => s + Math.max(1, c.score), 0);
+      const suggestions = candidates.map((c: { symbol: string; score: number }) => {
+        const weight = Math.max(1, c.score) / scoreSum;
+        const riskForName = totalRiskCapital * weight;
+        const maxPositionValue = riskForName / (cappedStopLossPct / 100);
+        return {
+          symbol: c.symbol,
+          score: c.score,
+          targetWeightPct: Number((weight * 100).toFixed(2)),
+          maxPositionValue: Number(maxPositionValue.toFixed(2)),
+          riskCapital: Number(riskForName.toFixed(2)),
+        };
+      });
+      return res.json({
+        success: true,
+        data: {
+          capital,
+          riskBudgetPct: cappedRiskBudgetPct,
+          stopLossPct: cappedStopLossPct,
+          rebalanceCadenceDays: 30,
+          suggestions,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "position_sizing_failed" });
+    }
+  });
+
+  app.get("/api/metrics", requireAdmin, (_req, res) => {
+    const queueDepth = outcomeQueue.length;
+    const runningJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "running").length;
+    const queuedJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "queued").length;
+    return res.json({
+      success: true,
+      data: {
+        ...metrics,
+        queueDepth,
+        runningJobs,
+        queuedJobs,
+        asOf: new Date().toISOString(),
+      },
+    });
+  });
+
+  app.get("/api/portfolio/holding-metrics", async (req, res) => {
+    try {
+      const symbol = String(req.query.symbol || "").trim();
+      const purchaseDate = String(req.query.purchaseDate || "").trim();
+      const quantity = Number(req.query.quantity || 0);
+      if (!symbol || !purchaseDate || !/^\d{4}-\d{2}-\d{2}$/.test(purchaseDate)) {
+        return res.status(400).json({ success: false, error: "symbol and purchaseDate(YYYY-MM-DD) are required" });
+      }
+      const isIndian = /\.NS$|\.BO$/i.test(symbol);
+      const series = isIndian
+        ? await fetchIndianDailySeriesFromExchanges(
+            symbol,
+            format(subDays(new Date(purchaseDate), 10), "yyyy-MM-dd")
+          )
+        : await fetchNasdaqDailyHistory(symbol, format(subDays(new Date(purchaseDate), 10), "yyyy-MM-dd"));
+      if (!series.length) return res.status(404).json({ success: false, error: "no_price_series" });
+      const entry = series.find((c) => c.date >= purchaseDate) || series[0];
+      const current = series[series.length - 1];
+      const prev = series.length > 1 ? series[series.length - 2] : current;
+      const purchasePrice = entry.close;
+      const currentPrice = current.close;
+      const investmentValue = quantity > 0 ? quantity * purchasePrice : null;
+      const marketValue = quantity > 0 ? quantity * currentPrice : null;
+      const dailyPctGain = prev.close > 0 ? ((currentPrice / prev.close) - 1) * 100 : null;
+      const totalPctGain = purchasePrice > 0 ? ((currentPrice / purchasePrice) - 1) * 100 : null;
+      res.json({
+        success: true,
+        data: {
+          symbol,
+          purchaseDate: entry.date,
+          purchasePrice,
+          currentDate: current.date,
+          currentPrice,
+          quantity: quantity > 0 ? quantity : null,
+          investmentValue,
+          marketValue,
+          dailyPctGain,
+          totalPctGain,
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "holding_metrics_failed" });
+    }
+  });
+
+  app.get("/api/company/validate-recency", async (req, res) => {
+    try {
+      const { url, country, symbol } = req.query as Record<string, string>;
+      if (!url) return res.status(400).json({ success: false, error: "url is required" });
+      let resolvedSymbol = symbol;
+      if (!resolvedSymbol) {
+        if (country === "US") resolvedSymbol = (url.match(/\/quote\/([^\/\?]+)/)?.[1] || "").toUpperCase();
+        else resolvedSymbol = resolveIndianExchangeSymbol(url) || "";
+      }
+      if (!resolvedSymbol) return res.status(404).json({ success: false, error: "symbol_not_resolved" });
+      let latestAnnouncementDate: string | null = null;
+      if (country === "US") {
+        const filings = await fetchSecFilingsForTicker(resolvedSymbol, 5, "sec_val_");
+        latestAnnouncementDate = filings[0]?.date ? new Date(filings[0].date).toISOString() : null;
+      } else {
+        const row = await db.get(
+          "SELECT date FROM announcements WHERE symbol = ? ORDER BY datetime(date) DESC LIMIT 1",
+          [resolvedSymbol.replace(/\.NS$|\.BO$/i, "")]
+        );
+        latestAnnouncementDate = row?.date || null;
+      }
+      const payload = normalizeRecencyValidationData({
+        symbol: resolvedSymbol,
+        latestAnnouncementDate,
+        checkedAt: new Date().toISOString(),
+      });
+      if (!payload) {
+        return res.status(500).json({ success: false, error: "recency_contract_invalid" });
+      }
+      res.json({ success: true, data: payload });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "validate_recency_failed" });
+    }
+  });
+
+  app.get("/api/company/judge", async (req, res) => {
+    try {
+      const { url, country, symbol } = req.query as Record<string, string>;
+      if (!url) return res.status(400).json({ success: false, error: "url is required" });
+      let report: CompanyReportData | null = null;
+      let reportSource = "live";
+      try {
+        const normalizedUrl = url.startsWith("http") ? url : `https://www.screener.in${url}`;
+        const cached = await db.get(
+          "SELECT reportJson FROM saved_reports WHERE country = ? AND sourceUrl = ? ORDER BY datetime(createdAt) DESC LIMIT 1",
+          [country || "IN", normalizedUrl]
+        );
+        if (cached?.reportJson) {
+          report = JSON.parse(cached.reportJson) as CompanyReportData;
+          reportSource = "saved";
+        } else {
+          const reportResp = await axios.get(`http://127.0.0.1:${PORT}/api/company/report`, {
+            params: { url, country, includeAI: "false", reportType: "quick" },
+            timeout: 25000,
+          });
+          report = (reportResp.data?.data || null) as CompanyReportData | null;
+        }
+      } catch (reportErr: any) {
+        console.warn("[Judge] Report fetch failed, proceeding with partial validation:", reportErr.message);
+      }
+      const safeReport: CompanyReportData = report || {
+        name: "Unknown",
+        chartData: [],
+        quarterlyData: [],
+        recentAnnouncements: [],
+        aiReport: "",
+        reportType: "quick",
+      };
+      const valResp = await axios.get(`http://127.0.0.1:${PORT}/api/company/validate-recency`, {
+        params: { url, country, symbol },
+        timeout: 12000,
+      });
+      const latestAnnouncementDate = valResp.data?.data?.latestAnnouncementDate || null;
+      const qualityGate = assessReportQuality(safeReport, latestAnnouncementDate);
+      const payload = normalizeJudgeValidationData({
+        ...qualityGate,
+        hasRecentAnnouncements: Array.isArray(safeReport.recentAnnouncements) && safeReport.recentAnnouncements.length > 0,
+        reportSource,
+      });
+      if (!payload) {
+        return res.status(500).json({ success: false, error: "judge_contract_invalid" });
+      }
+      res.json({
+        success: true,
+        data: payload,
+      });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || "judge_failed" });
+    }
+  });
+
+  app.get("/api/ai/test-models", async (_req, res) => {
+    try {
+      const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+      if (!apiKey) return res.status(400).json({ success: false, error: "GEMINI_API_KEY is not configured" });
+      const ai = new GoogleGenAI({ apiKey });
+      const models = await listAvailableGeminiTextModels(ai);
+      const probePrompt = "Reply with exactly: OK";
+      const rows: Array<{ model: string; ok: boolean; error?: string }> = [];
+      for (const model of models) {
+        try {
+          const result = await ai.models.generateContent({ model, contents: probePrompt });
+          const text = String(result?.text || "").trim();
+          rows.push({ model, ok: text.length > 0 });
+        } catch (e: any) {
+          rows.push({ model, ok: false, error: formatAIError(e) });
+        }
+      }
+      return res.json({
+        success: true,
+        data: {
+          testedAt: new Date().toISOString(),
+          total: rows.length,
+          ok: rows.filter((r) => r.ok).length,
+          failed: rows.filter((r) => !r.ok).length,
+          models: rows,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "ai_model_test_failed" });
     }
   });
 
@@ -1694,10 +2653,17 @@ async function startServer() {
 
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error("[Global Error Handler]:", err);
+    const reqId = (res.locals as any)?.reqId || "unknown";
+    console.error("[Global Error Handler]:", JSON.stringify({
+      reqId,
+      method: req.method,
+      path: req.path,
+      message: err?.message || String(err),
+    }));
     res.status(500).json({ 
       success: false, 
       error: "Internal Server Error",
+      reqId,
       message: process.env.NODE_ENV === 'development' ? err.message : undefined
     });
   });
