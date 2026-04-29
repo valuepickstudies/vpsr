@@ -1,5 +1,5 @@
-import type { CompanyReportData, CompanySnapshotData, QualityGateResult, ReportType } from "../../shared/reportTypes";
-import { isCompanySnapshotData, isQualityGateResult, normalizeCompanyReportData, normalizeJudgeValidationData, normalizeRecencyValidationData, type JudgeValidationData, type RecencyValidationData } from "../../shared/reportContracts";
+import type { CompanyReportData, CompanySnapshotData, QualityGateResult, RecommendationData, ReportType } from "../../shared/reportTypes";
+import { isCompanySnapshotData, isQualityGateResult, normalizeCompanyReportData, normalizeJudgeValidationData, normalizeRecencyValidationData, normalizeRecommendationData, type JudgeValidationData, type RecommendationCalibrationData, type RecencyValidationData } from "../../shared/reportContracts";
 import { normalizeSavedReportDetail, normalizeSavedReportList, type SavedReportDetail, type SavedReportListItem } from "../../shared/savedReportContracts";
 import { fetchJSON, type ApiResponse } from "./apiClient";
 
@@ -24,6 +24,7 @@ export type ReportScoreData = {
     };
     generatedAt: string;
   };
+  recommendationId?: number;
 };
 
 export type OutcomesSummaryData = {
@@ -45,6 +46,18 @@ export type ThesisMemoryData = {
   invalidatedReason: string | null;
   invalidatedAt: string | null;
   updatedAt: string;
+};
+
+export type RecommendationPolicyData = {
+  version: string;
+  weights: {
+    quality: number;
+    valuation: number;
+    momentum: number;
+    risk: number;
+  };
+  metrics: unknown;
+  createdAt: string;
 };
 
 export async function fetchCompanyReport(
@@ -150,4 +163,44 @@ export async function fetchOutcomesSummary(
 export async function fetchThesisMemory(symbol: string, country: "IN" | "US"): Promise<ApiResponse<ThesisMemoryData>> {
   const params = new URLSearchParams({ symbol, country });
   return fetchJSON<ThesisMemoryData>(`/api/company/thesis?${params.toString()}`);
+}
+
+export async function fetchRecommendationById(id: number): Promise<ApiResponse<RecommendationData>> {
+  const result = await fetchJSON<unknown>(`/api/recommendations/${id}`);
+  if (!result.success) return result as ApiResponse<RecommendationData>;
+  const normalized = normalizeRecommendationData(result.data);
+  if (!normalized) return { success: false, error: "invalid_recommendation_contract" };
+  return { success: true, data: normalized };
+}
+
+export async function createRecommendation(input: {
+  reportId?: number | null;
+  symbol: string;
+  country: "IN" | "US";
+  recommendationAction: "buy" | "watch" | "avoid";
+  confidencePct: number;
+  horizonDays: number;
+  riskClass: "low" | "medium" | "high";
+  explainability: {
+    positive: string[];
+    negative: string[];
+    caveats: string[];
+  };
+  scoreSnapshot: RecommendationData["scoreSnapshot"];
+  policyVersion?: string;
+}): Promise<ApiResponse<{ id: number }>> {
+  return fetchJSON<{ id: number }>("/api/recommendations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function fetchRecommendationCalibration(windowDays = 180): Promise<ApiResponse<RecommendationCalibrationData>> {
+  const params = new URLSearchParams({ windowDays: String(windowDays) });
+  return fetchJSON<RecommendationCalibrationData>(`/api/recommendations-calibration?${params.toString()}`);
+}
+
+export async function fetchLatestRecommendationPolicy(): Promise<ApiResponse<RecommendationPolicyData>> {
+  return fetchJSON<RecommendationPolicyData>("/api/recommendations/policy/latest");
 }

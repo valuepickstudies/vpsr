@@ -36,7 +36,7 @@ import { STRATEGY_PORTFOLIOS, type StrategyId } from '../strategyPortfolios';
 import type { CompanyReportData, CompanySnapshotData, QualityGateResult, ReportType } from '../shared/reportTypes';
 import type { SavedReportListItem } from '../shared/savedReportContracts';
 import { fetchJSON } from './services/apiClient';
-import { fetchCompanyReport, fetchCompanySnapshot, fetchOutcomesSummary, fetchReportQuality, fetchReportScoreById, fetchSavedReports, fetchThesisMemory, type OutcomesSummaryData, type ReportScoreData, type ThesisMemoryData } from './services/reportService';
+import { createRecommendation, fetchCompanyReport, fetchCompanySnapshot, fetchLatestRecommendationPolicy, fetchOutcomesSummary, fetchRecommendationById, fetchRecommendationCalibration, fetchReportQuality, fetchReportScoreById, fetchSavedReports, fetchThesisMemory, type OutcomesSummaryData, type RecommendationPolicyData, type ReportScoreData, type ThesisMemoryData } from './services/reportService';
 import { fetchHoldingMetrics, fetchPositionSizing, fetchStrategyPerformance, type PositionSizingData } from './services/portfolioService';
 import { getErrorMessage } from './utils/errorUtils';
 import ScannerWorkspace, { type ScannerStrategy } from './components/ScannerWorkspace';
@@ -396,6 +396,19 @@ export default function App() {
   const [loadingScoreAndOutcomes, setLoadingScoreAndOutcomes] = useState(false);
   const [thesisMemory, setThesisMemory] = useState<ThesisMemoryData | null>(null);
   const [positionSizing, setPositionSizing] = useState<PositionSizingData | null>(null);
+  const [recommendation, setRecommendation] = useState<{
+    action: "buy" | "watch" | "avoid";
+    confidencePct: number;
+    horizonDays: number;
+    riskClass: "low" | "medium" | "high";
+    explainability: { positive: string[]; negative: string[]; caveats: string[] };
+  } | null>(null);
+  const [recommendationCalibration, setRecommendationCalibration] = useState<{
+    sampleCount: number;
+    brierLikeScore: number | null;
+    hitRateAtBand: number | null;
+  } | null>(null);
+  const [recommendationPolicy, setRecommendationPolicy] = useState<RecommendationPolicyData | null>(null);
   const [customPortfolios, setCustomPortfolios] = useState<CustomPortfolio[]>(() => {
     try {
       const raw = localStorage.getItem('customPortfolios');
@@ -677,12 +690,49 @@ export default function App() {
     if (!selectedCompany) return;
     setLoadingScoreAndOutcomes(true);
     try {
+      let recommendationConfidencePct: number | null = null;
       const saved = await fetchSavedReports(country, selectedCompany.symbol || selectedCompany.id);
       const latestReport = saved.success && saved.data.length > 0 ? saved.data[0] : null;
       if (latestReport) {
         const score = await fetchReportScoreById(Number(latestReport.id));
         if (score.success) {
           setReportScore(score.data.scorecard);
+          let recId = score.data.recommendationId;
+          if (!recId) {
+            const rec = await createRecommendation({
+              reportId: Number(latestReport.id),
+              symbol: (selectedCompany.symbol || selectedCompany.id).toUpperCase(),
+              country,
+              recommendationAction: score.data.scorecard.totalScore >= 72 ? "buy" : score.data.scorecard.totalScore >= 52 ? "watch" : "avoid",
+              confidencePct: Math.max(5, Math.min(95, Math.round(score.data.scorecard.totalScore * 0.85))),
+              horizonDays: 90,
+              riskClass: score.data.scorecard.breakdown.risk >= 70 ? "low" : score.data.scorecard.breakdown.risk >= 45 ? "medium" : "high",
+              explainability: {
+                positive: [`quality:${score.data.scorecard.breakdown.quality}`, `valuation:${score.data.scorecard.breakdown.valuation}`],
+                negative: [`risk:${100 - score.data.scorecard.breakdown.risk}`],
+                caveats: ["outcomes can vary by market regime"],
+              },
+              scoreSnapshot: score.data.scorecard,
+            });
+            recId = rec.success ? rec.data.id : undefined;
+          }
+          if (recId) {
+            const recData = await fetchRecommendationById(recId);
+            if (recData.success) {
+              recommendationConfidencePct = recData.data.confidencePct;
+              setRecommendation({
+                action: recData.data.recommendationAction,
+                confidencePct: recData.data.confidencePct,
+                horizonDays: recData.data.horizonDays,
+                riskClass: recData.data.riskClass,
+                explainability: recData.data.explainability,
+              });
+            } else {
+              setRecommendation(null);
+            }
+          } else {
+            setRecommendation(null);
+          }
           const sizing = await fetchPositionSizing({
             capital: strategyInvestmentAmount || 100000,
             riskBudgetPct: 1,
@@ -695,10 +745,29 @@ export default function App() {
       } else {
         setReportScore(null);
         setPositionSizing(null);
+        setRecommendation(null);
       }
       const outcomes = await fetchOutcomesSummary(90, country);
       if (outcomes.success) setOutcomesSummary(outcomes.data);
       else setOutcomesSummary(null);
+      const calibration = await fetchRecommendationCalibration(180);
+      if (calibration.success && recommendationConfidencePct != null) {
+        const band = calibration.data.buckets.find((b) => recommendationConfidencePct >= b.minConfidence && recommendationConfidencePct <= b.maxConfidence) || null;
+        setRecommendationCalibration({
+          sampleCount: calibration.data.sampleCount,
+          brierLikeScore: calibration.data.brierLikeScore,
+          hitRateAtBand: band?.hitRatePct ?? null,
+        });
+      } else {
+        setRecommendationCalibration(calibration.success ? {
+          sampleCount: calibration.data.sampleCount,
+          brierLikeScore: calibration.data.brierLikeScore,
+          hitRateAtBand: null,
+        } : null);
+      }
+      const policy = await fetchLatestRecommendationPolicy();
+      if (policy.success) setRecommendationPolicy(policy.data);
+      else setRecommendationPolicy(null);
       const thesis = await fetchThesisMemory((selectedCompany.symbol || selectedCompany.id).toUpperCase(), country);
       if (thesis.success) setThesisMemory(thesis.data);
       else setThesisMemory(null);
@@ -708,6 +777,9 @@ export default function App() {
       setOutcomesSummary(null);
       setThesisMemory(null);
       setPositionSizing(null);
+      setRecommendation(null);
+      setRecommendationCalibration(null);
+      setRecommendationPolicy(null);
     } finally {
       setLoadingScoreAndOutcomes(false);
     }
@@ -2144,6 +2216,9 @@ export default function App() {
                             maxPositionValue: s.maxPositionValue,
                           })),
                         } : null}
+                        recommendation={recommendation}
+                        recommendationCalibration={recommendationCalibration}
+                        recommendationPolicyVersion={recommendationPolicy?.version || null}
                       />
                     </div>
                   ) : (

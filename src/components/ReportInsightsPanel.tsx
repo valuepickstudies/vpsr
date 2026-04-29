@@ -36,6 +36,19 @@ type ReportInsightsPanelProps = {
   degradedSourceWarnings: string[];
   thesisMemory: { thesis: string; status: "active" | "invalidated"; invalidationTriggers: string[] } | null;
   positionSizing: { riskBudgetPct: number; stopLossPct: number; suggestions: Array<{ symbol: string; targetWeightPct: number; maxPositionValue: number }> } | null;
+  recommendation: {
+    action: "buy" | "watch" | "avoid";
+    confidencePct: number;
+    horizonDays: number;
+    riskClass: "low" | "medium" | "high";
+    explainability: { positive: string[]; negative: string[]; caveats: string[] };
+  } | null;
+  recommendationCalibration: {
+    sampleCount: number;
+    brierLikeScore: number | null;
+    hitRateAtBand: number | null;
+  } | null;
+  recommendationPolicyVersion: string | null;
 };
 
 export default function ReportInsightsPanel(props: ReportInsightsPanelProps) {
@@ -62,6 +75,9 @@ export default function ReportInsightsPanel(props: ReportInsightsPanelProps) {
     degradedSourceWarnings,
     thesisMemory,
     positionSizing,
+    recommendation,
+    recommendationCalibration,
+    recommendationPolicyVersion,
   } = props;
 
   return (
@@ -140,6 +156,30 @@ export default function ReportInsightsPanel(props: ReportInsightsPanelProps) {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="bg-white rounded-xl border border-gray-200 p-5">
+          <h3 className="font-semibold text-gray-900 mb-3">Decision Engine Recommendation</h3>
+          {recommendation ? (
+            <div className="space-y-2 text-sm">
+              <p className="text-gray-700">Action: <span className="font-semibold uppercase">{recommendation.action}</span></p>
+              <p className="text-gray-700">Confidence: <span className="font-semibold">{recommendation.confidencePct}%</span></p>
+              <p className="text-gray-700">Horizon/Risk: <span className="font-semibold">{recommendation.horizonDays}d / {recommendation.riskClass.toUpperCase()}</span></p>
+              <p className="text-gray-700">Policy version: <span className="font-semibold">{recommendationPolicyVersion || "rules_v1"}</span></p>
+              {(recommendation.explainability.positive || []).length > 0 && (
+                <ul className="list-disc pl-5 text-emerald-700">
+                  {recommendation.explainability.positive.map((p) => <li key={p}>+ {p}</li>)}
+                </ul>
+              )}
+              {(recommendation.explainability.negative || []).length > 0 && (
+                <ul className="list-disc pl-5 text-red-700">
+                  {recommendation.explainability.negative.map((n) => <li key={n}>- {n}</li>)}
+                </ul>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">Recommendation will appear after scoring completes.</p>
+          )}
+        </div>
+
+        <div className="bg-white rounded-xl border border-gray-200 p-5">
           <h3 className="font-semibold text-gray-900 mb-3">Alpha Scorecard</h3>
           {loadingScoreAndOutcomes ? (
             <p className="text-sm text-gray-500">Computing score and outcomes...</p>
@@ -198,6 +238,19 @@ export default function ReportInsightsPanel(props: ReportInsightsPanelProps) {
             </div>
           )}
         </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-gray-200 p-5">
+        <h3 className="font-semibold text-gray-900 mb-2">Calibration & Trust</h3>
+        {recommendationCalibration ? (
+          <div className="space-y-2 text-sm">
+            <p className="text-gray-700">Samples: <span className="font-semibold">{recommendationCalibration.sampleCount}</span></p>
+            <p className="text-gray-700">Expected precision at this band: <span className="font-semibold">{recommendationCalibration.hitRateAtBand == null ? "N/A" : `${recommendationCalibration.hitRateAtBand.toFixed(1)}%`}</span></p>
+            <p className="text-gray-700">Calibration loss (brier-like): <span className="font-semibold">{recommendationCalibration.brierLikeScore == null ? "N/A" : recommendationCalibration.brierLikeScore.toFixed(4)}</span></p>
+          </div>
+        ) : (
+          <p className="text-sm text-gray-500">Calibration metrics unavailable.</p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

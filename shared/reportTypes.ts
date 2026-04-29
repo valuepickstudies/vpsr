@@ -55,3 +55,33 @@ export type QualityGateResult = {
   latestAnnouncementDate: string | null;
   checkedAt: string;
 };
+
+export type RecommendationAction = "buy" | "watch" | "avoid";
+
+export type RecommendationData = {
+  id: number;
+  reportId: number | null;
+  symbol: string;
+  country: "IN" | "US";
+  recommendationAction: RecommendationAction;
+  confidencePct: number;
+  horizonDays: number;
+  riskClass: "low" | "medium" | "high";
+  explainability: {
+    positive: string[];
+    negative: string[];
+    caveats: string[];
+  };
+  scoreSnapshot: {
+    totalScore: number;
+    verdict: "strong" | "watch" | "weak";
+    breakdown: {
+      quality: number;
+      valuation: number;
+      momentum: number;
+      risk: number;
+    };
+  };
+  policyVersion: string;
+  createdAt: string;
+};

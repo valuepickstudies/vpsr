@@ -1,4 +1,4 @@
-import type { CompanyReportData, CompanySnapshotData, QualityGateResult, ReportAnnouncement, ReportChartRow, ReportQuarterlyRow, ReportType } from "./reportTypes";
+import type { CompanyReportData, CompanySnapshotData, QualityGateResult, RecommendationData, ReportAnnouncement, ReportChartRow, ReportQuarterlyRow, ReportType } from "./reportTypes";
 
 const REPORT_TYPES: ReportType[] = ["deep", "standard", "quick"];
 
@@ -121,5 +121,61 @@ export function normalizeJudgeValidationData(input: unknown): JudgeValidationDat
     ...input,
     hasRecentAnnouncements: obj.hasRecentAnnouncements,
     reportSource: obj.reportSource,
+  };
+}
+
+export type RecommendationCalibrationData = {
+  windowDays: number;
+  sampleCount: number;
+  brierLikeScore: number | null;
+  buckets: Array<{
+    minConfidence: number;
+    maxConfidence: number;
+    count: number;
+    hitRatePct: number | null;
+    avgReturnPct: number | null;
+  }>;
+  generatedAt: string;
+};
+
+export function normalizeRecommendationData(input: unknown): RecommendationData | null {
+  const obj = input as Record<string, unknown>;
+  const id = asFiniteNumber(obj?.id);
+  const symbol = asString(obj?.symbol);
+  const country = asString(obj?.country);
+  const recommendationAction = asString(obj?.recommendationAction);
+  const confidencePct = asFiniteNumber(obj?.confidencePct);
+  const horizonDays = asFiniteNumber(obj?.horizonDays);
+  const riskClass = asString(obj?.riskClass);
+  const policyVersion = asString(obj?.policyVersion);
+  const createdAt = asString(obj?.createdAt);
+  const scoreSnapshot = obj?.scoreSnapshot as RecommendationData["scoreSnapshot"] | undefined;
+  const explainability = obj?.explainability as RecommendationData["explainability"] | undefined;
+  if (
+    id == null ||
+    !symbol ||
+    (country !== "IN" && country !== "US") ||
+    (recommendationAction !== "buy" && recommendationAction !== "watch" && recommendationAction !== "avoid") ||
+    confidencePct == null ||
+    horizonDays == null ||
+    (riskClass !== "low" && riskClass !== "medium" && riskClass !== "high") ||
+    !policyVersion ||
+    !createdAt ||
+    !scoreSnapshot ||
+    !explainability
+  ) return null;
+  return {
+    id,
+    reportId: asFiniteNumber(obj?.reportId),
+    symbol,
+    country,
+    recommendationAction,
+    confidencePct,
+    horizonDays,
+    riskClass,
+    scoreSnapshot,
+    explainability,
+    policyVersion,
+    createdAt,
   };
 }

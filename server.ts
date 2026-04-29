@@ -102,6 +102,32 @@ type OutcomeRefreshJob = {
   error?: string;
 };
 
+type RecommendationDecision = {
+  reportId: number | null;
+  symbol: string;
+  country: "IN" | "US";
+  recommendationAction: "buy" | "watch" | "avoid";
+  confidencePct: number;
+  horizonDays: number;
+  riskClass: "low" | "medium" | "high";
+  explainability: {
+    positive: string[];
+    negative: string[];
+    caveats: string[];
+  };
+  scoreSnapshot: {
+    totalScore: number;
+    verdict: "strong" | "watch" | "weak";
+    breakdown: {
+      quality: number;
+      valuation: number;
+      momentum: number;
+      risk: number;
+    };
+  };
+  policyVersion: string;
+};
+
 function normalizeIndianAnnouncementCategory(input: string): string {
   const v = String(input || "").toLowerCase();
   if (v.includes("result")) return "Result";
@@ -968,6 +994,7 @@ async function startServer() {
   await db.exec(`
     CREATE TABLE IF NOT EXISTS report_outcomes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recommendationId INTEGER,
       reportId INTEGER NOT NULL,
       symbol TEXT NOT NULL,
       country TEXT NOT NULL,
@@ -985,6 +1012,11 @@ async function startServer() {
     )
   `);
 
+  const reportOutcomeCols: Array<{ name: string }> = await db.all("PRAGMA table_info(report_outcomes)");
+  if (!reportOutcomeCols.some((c) => c.name === "recommendationId")) {
+    await db.exec("ALTER TABLE report_outcomes ADD COLUMN recommendationId INTEGER");
+  }
+
   await db.exec(`
     CREATE TABLE IF NOT EXISTS company_thesis_memory (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -998,6 +1030,63 @@ async function startServer() {
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL,
       UNIQUE(symbol, country)
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS recommendations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reportId INTEGER,
+      symbol TEXT NOT NULL,
+      country TEXT NOT NULL,
+      recommendationAction TEXT NOT NULL,
+      confidencePct REAL NOT NULL,
+      horizonDays INTEGER NOT NULL,
+      riskClass TEXT NOT NULL,
+      explainabilityJson TEXT NOT NULL,
+      scoreSnapshotJson TEXT NOT NULL,
+      policyVersion TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS recommendation_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recommendationId INTEGER NOT NULL,
+      actionType TEXT NOT NULL,
+      actorType TEXT NOT NULL,
+      actorId TEXT,
+      executionPrice REAL,
+      executionDate TEXT,
+      sizeValue REAL,
+      notes TEXT,
+      createdAt TEXT NOT NULL
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS policy_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      version TEXT UNIQUE NOT NULL,
+      weightsJson TEXT NOT NULL,
+      metricsJson TEXT,
+      notes TEXT,
+      createdAt TEXT NOT NULL
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      inputJson TEXT NOT NULL,
+      resultJson TEXT,
+      error TEXT,
+      createdAt TEXT NOT NULL,
+      startedAt TEXT,
+      finishedAt TEXT
     )
   `);
 
@@ -1018,6 +1107,110 @@ async function startServer() {
         input.sourceUrl,
         JSON.stringify(input.report),
         new Date().toISOString(),
+      ]
+    );
+  }
+
+  async function ensureInitialPolicyVersion() {
+    const existing = await db.get<{ id: number }>("SELECT id FROM policy_versions WHERE version = ?", ["rules_v1"]);
+    if (existing) return;
+    await db.run(
+      `INSERT INTO policy_versions (version, weightsJson, metricsJson, notes, createdAt)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        "rules_v1",
+        JSON.stringify({ quality: 0.35, valuation: 0.2, momentum: 0.25, risk: 0.2 }),
+        JSON.stringify({ seed: true }),
+        "Initial deterministic policy weights",
+        new Date().toISOString(),
+      ]
+    );
+  }
+
+  await ensureInitialPolicyVersion();
+
+  function buildRecommendationFromScore(input: {
+    reportId: number | null;
+    symbol: string;
+    country: "IN" | "US";
+    scorecard: {
+      totalScore: number;
+      verdict: "strong" | "watch" | "weak";
+      breakdown: { quality: number; valuation: number; momentum: number; risk: number };
+    };
+  }): RecommendationDecision {
+    const score = input.scorecard.totalScore;
+    const recommendationAction = score >= 72 ? "buy" : score >= 52 ? "watch" : "avoid";
+    const riskClass = input.scorecard.breakdown.risk >= 70 ? "low" : input.scorecard.breakdown.risk >= 45 ? "medium" : "high";
+    const confidencePct = Math.max(5, Math.min(95, Math.round(score * 0.82 + input.scorecard.breakdown.quality * 0.18)));
+    const explainability = {
+      positive: [
+        `quality:${input.scorecard.breakdown.quality}`,
+        `valuation:${input.scorecard.breakdown.valuation}`,
+      ],
+      negative: [
+        `risk:${100 - input.scorecard.breakdown.risk}`,
+      ],
+      caveats: [
+        "outcomes should be interpreted with horizon-specific volatility",
+      ],
+    };
+    return {
+      reportId: input.reportId,
+      symbol: input.symbol,
+      country: input.country,
+      recommendationAction,
+      confidencePct,
+      horizonDays: 90,
+      riskClass,
+      explainability,
+      scoreSnapshot: input.scorecard,
+      policyVersion: "rules_v1",
+    };
+  }
+
+  async function saveRecommendation(rec: RecommendationDecision) {
+    const inserted = await db.run(
+      `INSERT INTO recommendations
+       (reportId, symbol, country, recommendationAction, confidencePct, horizonDays, riskClass, explainabilityJson, scoreSnapshotJson, policyVersion, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        rec.reportId,
+        rec.symbol,
+        rec.country,
+        rec.recommendationAction,
+        rec.confidencePct,
+        rec.horizonDays,
+        rec.riskClass,
+        JSON.stringify(rec.explainability),
+        JSON.stringify(rec.scoreSnapshot),
+        rec.policyVersion,
+        new Date().toISOString(),
+      ]
+    );
+    return inserted.lastID;
+  }
+
+  async function updateJobRow(job: OutcomeRefreshJob) {
+    await db.run(
+      `INSERT INTO jobs (id, type, status, inputJson, resultJson, error, createdAt, startedAt, finishedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         status=excluded.status,
+         resultJson=excluded.resultJson,
+         error=excluded.error,
+         startedAt=excluded.startedAt,
+         finishedAt=excluded.finishedAt`,
+      [
+        job.id,
+        "outcomes_refresh",
+        job.status,
+        JSON.stringify(job.input),
+        job.result ? JSON.stringify(job.result) : null,
+        job.error || null,
+        job.createdAt,
+        job.startedAt,
+        job.finishedAt,
       ]
     );
   }
@@ -1103,11 +1296,19 @@ async function startServer() {
         } catch (e: unknown) {
           status = e instanceof Error ? e.message : "refresh_failed";
         }
+        const recommendation = await db.get<{ id: number }>(
+          `SELECT id FROM recommendations
+           WHERE reportId = ?
+           ORDER BY datetime(createdAt) DESC
+           LIMIT 1`,
+          [row.id]
+        );
         await db.run(
           `INSERT INTO report_outcomes
-           (reportId, symbol, country, horizonDays, reportDate, entryDate, entryPrice, targetDate, targetPrice, returnPct, status, createdAt, updatedAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (recommendationId, reportId, symbol, country, horizonDays, reportDate, entryDate, entryPrice, targetDate, targetPrice, returnPct, status, createdAt, updatedAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(reportId, horizonDays) DO UPDATE SET
+             recommendationId=excluded.recommendationId,
              symbol=excluded.symbol,
              country=excluded.country,
              reportDate=excluded.reportDate,
@@ -1119,6 +1320,7 @@ async function startServer() {
              status=excluded.status,
              updatedAt=excluded.updatedAt`,
           [
+            recommendation?.id || null,
             row.id,
             row.symbol,
             normalizedCountry,
@@ -1140,6 +1342,79 @@ async function startServer() {
     return { processedReports: processed, refreshedOutcomes: refreshed, horizons };
   }
 
+  async function computeRecommendationCalibration(windowDays: number) {
+    const sinceIso = new Date(Date.now() - Math.max(1, windowDays) * 24 * 60 * 60 * 1000).toISOString();
+    const rows: Array<{ confidencePct: number; returnPct: number | null; status: string }> = await db.all(
+      `SELECT r.confidencePct as confidencePct, o.returnPct as returnPct, o.status as status
+       FROM report_outcomes o
+       JOIN recommendations r ON r.id = o.recommendationId
+       WHERE datetime(o.updatedAt) >= datetime(?)`,
+      [sinceIso]
+    );
+    const usable = rows.filter((r) => r.status === "ok" && r.returnPct != null && Number.isFinite(Number(r.confidencePct)));
+    const bucketDefs = [
+      { min: 0, max: 20 },
+      { min: 20, max: 40 },
+      { min: 40, max: 60 },
+      { min: 60, max: 80 },
+      { min: 80, max: 101 },
+    ];
+    const buckets = bucketDefs.map((b) => {
+      const hitRows = usable.filter((r) => Number(r.confidencePct) >= b.min && Number(r.confidencePct) < b.max);
+      const hitRatePct = hitRows.length ? (hitRows.filter((r) => Number(r.returnPct) > 0).length / hitRows.length) * 100 : null;
+      const avgReturnPct = hitRows.length ? hitRows.reduce((s, r) => s + Number(r.returnPct), 0) / hitRows.length : null;
+      return {
+        minConfidence: b.min,
+        maxConfidence: b.max === 101 ? 100 : b.max,
+        count: hitRows.length,
+        hitRatePct,
+        avgReturnPct,
+      };
+    });
+    const brierLikeScore = usable.length
+      ? usable.reduce((s, r) => {
+          const p = Number(r.confidencePct) / 100;
+          const y = Number(r.returnPct) > 0 ? 1 : 0;
+          return s + (p - y) ** 2;
+        }, 0) / usable.length
+      : null;
+    return {
+      windowDays,
+      sampleCount: usable.length,
+      brierLikeScore,
+      buckets,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  async function runPolicyReweightingJob() {
+    const calibration = await computeRecommendationCalibration(180);
+    const defaultWeights = { quality: 0.35, valuation: 0.2, momentum: 0.25, risk: 0.2 };
+    const hitRate = calibration.sampleCount ? calibration.buckets.reduce((s, b) => s + (b.hitRatePct || 0) * b.count, 0) / calibration.sampleCount : 50;
+    const riskBias = hitRate < 45 ? 0.25 : 0.2;
+    const momentumBias = hitRate > 55 ? 0.28 : 0.25;
+    const qualityBias = 1 - (riskBias + momentumBias + defaultWeights.valuation);
+    const weights = {
+      quality: Number(qualityBias.toFixed(3)),
+      valuation: defaultWeights.valuation,
+      momentum: Number(momentumBias.toFixed(3)),
+      risk: Number(riskBias.toFixed(3)),
+    };
+    const version = `rules_v${Date.now()}`;
+    await db.run(
+      `INSERT INTO policy_versions (version, weightsJson, metricsJson, notes, createdAt)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        version,
+        JSON.stringify(weights),
+        JSON.stringify({ calibration }),
+        "Automated rules-first reweighting based on realized outcomes",
+        new Date().toISOString(),
+      ]
+    );
+    return { version, weights, calibration };
+  }
+
   async function drainOutcomeQueue() {
     if (outcomeWorkerRunning) return;
     outcomeWorkerRunning = true;
@@ -1149,6 +1424,7 @@ async function startServer() {
       if (!job) continue;
       job.status = "running";
       job.startedAt = new Date().toISOString();
+      await updateJobRow(job);
       try {
         const result = await refreshOutcomes(job.input);
         job.result = result;
@@ -1162,6 +1438,7 @@ async function startServer() {
         metrics.queueFailed += 1;
       }
       outcomeJobs.set(job.id, job);
+      await updateJobRow(job);
     }
     outcomeWorkerRunning = false;
   }
@@ -1337,6 +1614,13 @@ async function startServer() {
   // Sync every 5 minutes
   setInterval(syncAnnouncements, 5 * 60 * 1000);
 
+  // Recompute rules-first policy weights every day
+  setInterval(() => {
+    void runPolicyReweightingJob().catch((e) => {
+      console.warn("[Policy] Reweighting failed:", e instanceof Error ? e.message : String(e));
+    });
+  }, 24 * 60 * 60 * 1000);
+
   // API Routes
   app.get("/api/health", (req, res) => {
     res.json({ 
@@ -1347,6 +1631,26 @@ async function startServer() {
       keyLength: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : 0,
       keyStart: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 4) : null
     });
+  });
+
+  app.get("/api/recommendations/policy/latest", async (_req, res) => {
+    try {
+      const row = await db.get<{ version: string; weightsJson: string; metricsJson: string | null; createdAt: string }>(
+        "SELECT version, weightsJson, metricsJson, createdAt FROM policy_versions ORDER BY datetime(createdAt) DESC LIMIT 1"
+      );
+      if (!row) return res.status(404).json({ success: false, error: "policy_not_found" });
+      return res.json({
+        success: true,
+        data: {
+          version: row.version,
+          weights: JSON.parse(row.weightsJson || "{}"),
+          metrics: row.metricsJson ? JSON.parse(row.metricsJson) : null,
+          createdAt: row.createdAt,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "policy_fetch_failed" });
+    }
   });
 
   // Test Alpaca Connectivity
@@ -2218,6 +2522,15 @@ async function startServer() {
       const parsed = normalizeCompanyReportData(JSON.parse(row.reportJson));
       const quality = assessReportQuality(parsed, parsed.recentAnnouncements?.[0]?.date || null);
       const scorecard = buildReportScorecard(parsed, quality);
+      const symbolRow = await db.get<{ symbol: string | null }>("SELECT symbol FROM saved_reports WHERE id = ?", [req.params.id]);
+      const symbol = String(symbolRow?.symbol || parsed.name).toUpperCase();
+      const recommendation = buildRecommendationFromScore({
+        reportId: Number(req.params.id),
+        symbol,
+        country: row.country === "US" ? "US" : "IN",
+        scorecard,
+      });
+      const recommendationId = await saveRecommendation(recommendation);
       return res.json({
         success: true,
         data: {
@@ -2226,10 +2539,115 @@ async function startServer() {
           createdAt: row.createdAt,
           quality,
           scorecard,
+          recommendationId,
         },
       });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "score_failed" });
+    }
+  });
+
+  app.post("/api/recommendations", async (req, res) => {
+    try {
+      const symbol = String(req.body?.symbol || "").trim().toUpperCase();
+      const country = String(req.body?.country || "IN").trim().toUpperCase() === "US" ? "US" : "IN";
+      const recommendationAction = String(req.body?.recommendationAction || "watch").toLowerCase();
+      const confidencePct = Number(req.body?.confidencePct || 50);
+      const horizonDays = Number(req.body?.horizonDays || 90);
+      const riskClass = String(req.body?.riskClass || "medium").toLowerCase();
+      const explainability = req.body?.explainability || { positive: [], negative: [], caveats: [] };
+      const scoreSnapshot = req.body?.scoreSnapshot || { totalScore: 50, verdict: "watch", breakdown: { quality: 50, valuation: 50, momentum: 50, risk: 50 } };
+      const policyVersion = String(req.body?.policyVersion || "rules_v1");
+      if (!symbol) return res.status(400).json({ success: false, error: "symbol_required" });
+      if (!["buy", "watch", "avoid"].includes(recommendationAction)) return res.status(400).json({ success: false, error: "invalid_recommendation_action" });
+      if (!["low", "medium", "high"].includes(riskClass)) return res.status(400).json({ success: false, error: "invalid_risk_class" });
+      const id = await saveRecommendation({
+        reportId: req.body?.reportId != null ? Number(req.body.reportId) : null,
+        symbol,
+        country,
+        recommendationAction: recommendationAction as "buy" | "watch" | "avoid",
+        confidencePct: Math.max(0, Math.min(100, confidencePct)),
+        horizonDays: Math.max(1, horizonDays),
+        riskClass: riskClass as "low" | "medium" | "high",
+        explainability,
+        scoreSnapshot,
+        policyVersion,
+      });
+      return res.json({ success: true, data: { id } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "recommendation_create_failed" });
+    }
+  });
+
+  app.get("/api/recommendations/:id(\\d+)", async (req, res) => {
+    try {
+      const row = await db.get<{
+        id: number;
+        reportId: number | null;
+        symbol: string;
+        country: string;
+        recommendationAction: string;
+        confidencePct: number;
+        horizonDays: number;
+        riskClass: string;
+        explainabilityJson: string;
+        scoreSnapshotJson: string;
+        policyVersion: string;
+        createdAt: string;
+      }>("SELECT * FROM recommendations WHERE id = ?", [req.params.id]);
+      if (!row) return res.status(404).json({ success: false, error: "recommendation_not_found" });
+      return res.json({
+        success: true,
+        data: {
+          id: row.id,
+          reportId: row.reportId,
+          symbol: row.symbol,
+          country: row.country,
+          recommendationAction: row.recommendationAction,
+          confidencePct: row.confidencePct,
+          horizonDays: row.horizonDays,
+          riskClass: row.riskClass,
+          explainability: JSON.parse(row.explainabilityJson || "{}"),
+          scoreSnapshot: JSON.parse(row.scoreSnapshotJson || "{}"),
+          policyVersion: row.policyVersion,
+          createdAt: row.createdAt,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "recommendation_fetch_failed" });
+    }
+  });
+
+  app.post("/api/recommendations/:id(\\d+)/actions", async (req, res) => {
+    try {
+      const recommendationId = Number(req.params.id);
+      const actionType = String(req.body?.actionType || "").trim().toLowerCase();
+      const actorType = String(req.body?.actorType || "system").trim().toLowerCase();
+      if (!Number.isFinite(recommendationId) || recommendationId <= 0) {
+        return res.status(400).json({ success: false, error: "invalid_recommendation_id" });
+      }
+      if (!actionType) return res.status(400).json({ success: false, error: "action_type_required" });
+      const row = await db.get<{ id: number }>("SELECT id FROM recommendations WHERE id = ?", [recommendationId]);
+      if (!row) return res.status(404).json({ success: false, error: "recommendation_not_found" });
+      const inserted = await db.run(
+        `INSERT INTO recommendation_actions
+         (recommendationId, actionType, actorType, actorId, executionPrice, executionDate, sizeValue, notes, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          recommendationId,
+          actionType,
+          actorType,
+          req.body?.actorId ? String(req.body.actorId) : null,
+          req.body?.executionPrice != null ? Number(req.body.executionPrice) : null,
+          req.body?.executionDate ? String(req.body.executionDate) : null,
+          req.body?.sizeValue != null ? Number(req.body.sizeValue) : null,
+          req.body?.notes ? String(req.body.notes) : null,
+          new Date().toISOString(),
+        ]
+      );
+      return res.json({ success: true, data: { id: inserted.lastID } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "recommendation_action_failed" });
     }
   });
 
@@ -2261,6 +2679,7 @@ async function startServer() {
       outcomeJobs.set(jobId, job);
       outcomeQueue.push(jobId);
       metrics.queueEnqueued += 1;
+      await updateJobRow(job);
       void drainOutcomeQueue();
       return res.status(202).json({ success: true, data: { jobId, status: "queued" } });
     } catch (error: any) {
@@ -2269,9 +2688,27 @@ async function startServer() {
   });
 
   app.get("/api/reports/outcomes/jobs/:jobId", requireAdmin, (req, res) => {
-    const job = outcomeJobs.get(String(req.params.jobId || ""));
-    if (!job) return res.status(404).json({ success: false, error: "job_not_found" });
-    return res.json({ success: true, data: job });
+    const memJob = outcomeJobs.get(String(req.params.jobId || ""));
+    if (memJob) return res.json({ success: true, data: memJob });
+    db.get(
+      "SELECT * FROM jobs WHERE id = ?",
+      [String(req.params.jobId || "")]
+    ).then((jobRow: any) => {
+      if (!jobRow) return res.status(404).json({ success: false, error: "job_not_found" });
+      return res.json({
+        success: true,
+        data: {
+          id: jobRow.id,
+          status: jobRow.status,
+          input: JSON.parse(jobRow.inputJson || "{}"),
+          result: jobRow.resultJson ? JSON.parse(jobRow.resultJson) : undefined,
+          error: jobRow.error || undefined,
+          createdAt: jobRow.createdAt,
+          startedAt: jobRow.startedAt,
+          finishedAt: jobRow.finishedAt,
+        },
+      });
+    }).catch((e: any) => res.status(500).json({ success: false, error: e.message || "job_fetch_failed" }));
   });
 
   app.get("/api/reports/outcomes", async (req, res) => {
@@ -2309,6 +2746,19 @@ async function startServer() {
       });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "outcomes_failed" });
+    }
+  });
+
+  app.get("/api/recommendations-calibration", async (req, res) => {
+    try {
+      const windowDays = Number(req.query.windowDays || 180);
+      if (!Number.isFinite(windowDays) || windowDays <= 0) {
+        return res.status(400).json({ success: false, error: "windowDays must be a positive number" });
+      }
+      const data = await computeRecommendationCalibration(windowDays);
+      return res.json({ success: true, data });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "recommendation_calibration_failed" });
     }
   });
 
@@ -2442,10 +2892,19 @@ async function startServer() {
     }
   });
 
-  app.get("/api/metrics", requireAdmin, (_req, res) => {
+  app.get("/api/metrics", requireAdmin, async (_req, res) => {
     const queueDepth = outcomeQueue.length;
     const runningJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "running").length;
     const queuedJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "queued").length;
+    const persistedJobs = await db.get<{ total: number; queued: number; running: number; failed: number; completed: number }>(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) as queued,
+         SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) as running,
+         SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
+         SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as completed
+       FROM jobs`
+    );
     return res.json({
       success: true,
       data: {
@@ -2453,6 +2912,7 @@ async function startServer() {
         queueDepth,
         runningJobs,
         queuedJobs,
+        persistedJobs: persistedJobs || { total: 0, queued: 0, running: 0, failed: 0, completed: 0 },
         asOf: new Date().toISOString(),
       },
     });
