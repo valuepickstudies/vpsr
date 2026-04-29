@@ -18,6 +18,9 @@ import { buildReportScorecard } from "./reportScoring";
 import { isCompanySnapshotData, isQualityGateResult, normalizeCompanyReportData, normalizeJudgeValidationData, normalizeRecencyValidationData } from "./shared/reportContracts";
 import { normalizeAnnouncements, normalizeCompanyFundamentals, normalizeCompanySearchResults, normalizePriceHistoryData } from "./shared/marketContracts";
 import { normalizeSavedReportDetail, normalizeSavedReportList } from "./shared/savedReportContracts";
+import { normalizeIntelligenceValidationResult } from "./shared/documentContracts";
+import { createPostgresMirror, fireMirror, PostgresMirror } from "./server/postgresMirror";
+import { processAnnouncementDocuments, runValidationSweep, validateAnnouncementIntelligence } from "./server/documentIntelligence";
 
 const SEC_USER_AGENT = "MarketIntelligenceBot/1.0 (valuepicks25@gmail.com)";
 let cikToTicker: Record<string, string> = {};
@@ -99,6 +102,17 @@ type OutcomeRefreshJob = {
   status: "queued" | "running" | "completed" | "failed";
   input: { country: string; horizons: number[]; limit: number };
   result?: { processedReports: number; refreshedOutcomes: number; horizons: number[] };
+  error?: string;
+};
+
+type ValidationRefreshJob = {
+  id: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  status: "queued" | "running" | "completed" | "failed";
+  input: { limit: number; type: "all" | "results"; screenerUrl?: string };
+  result?: { processed: number; pass: number; warn: number; fail: number; drifted: number };
   error?: string;
 };
 
@@ -907,6 +921,9 @@ async function startServer() {
   const outcomeJobs = new Map<string, OutcomeRefreshJob>();
   const outcomeQueue: string[] = [];
   let outcomeWorkerRunning = false;
+  const validationJobs = new Map<string, ValidationRefreshJob>();
+  const validationQueue: string[] = [];
+  let validationWorkerRunning = false;
 
   app.use(cors());
   app.use(express.json());
@@ -965,6 +982,38 @@ async function startServer() {
       pdfLink TEXT,
       exchange TEXT,
       category TEXT
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS document_intelligence (
+      announcementId TEXT PRIMARY KEY,
+      symbol TEXT,
+      exchange TEXT,
+      pdfUrl TEXT,
+      contentSha256 TEXT,
+      docCategory TEXT,
+      textSnippet TEXT,
+      status TEXT NOT NULL,
+      error TEXT,
+      processedAt TEXT NOT NULL
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS validation_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      announcementId TEXT NOT NULL,
+      symbol TEXT,
+      exchange TEXT,
+      verdict TEXT NOT NULL,
+      reasonsJson TEXT NOT NULL,
+      nseMatched INTEGER NOT NULL DEFAULT 0,
+      bseMatched INTEGER NOT NULL DEFAULT 0,
+      screenerMatched INTEGER NOT NULL DEFAULT 0,
+      driftScore INTEGER NOT NULL DEFAULT 0,
+      mismatchSeverity TEXT NOT NULL DEFAULT 'low',
+      createdAt TEXT NOT NULL
     )
   `);
 
@@ -1090,6 +1139,9 @@ async function startServer() {
     )
   `);
 
+  let pgMirror: PostgresMirror | null = null;
+  pgMirror = await createPostgresMirror();
+
   async function saveGeneratedReport(input: {
     companyName: string;
     symbol?: string | null;
@@ -1097,7 +1149,9 @@ async function startServer() {
     sourceUrl: string;
     report: CompanyReportData;
   }) {
-    await db.run(
+    const createdAt = new Date().toISOString();
+    const reportJson = JSON.stringify(input.report);
+    const inserted = await db.run(
       `INSERT INTO saved_reports (companyName, symbol, country, sourceUrl, reportJson, createdAt)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
@@ -1105,26 +1159,41 @@ async function startServer() {
         input.symbol || null,
         input.country,
         input.sourceUrl,
-        JSON.stringify(input.report),
-        new Date().toISOString(),
+        reportJson,
+        createdAt,
       ]
     );
+    const sid = Number(inserted.lastID);
+    if (pgMirror && sid) {
+      fireMirror(
+        "saved_report",
+        pgMirror.insertSavedReport(sid, {
+          companyName: input.companyName,
+          symbol: input.symbol,
+          country: input.country,
+          sourceUrl: input.sourceUrl,
+          reportJson,
+          createdAt,
+        })
+      );
+    }
   }
 
   async function ensureInitialPolicyVersion() {
     const existing = await db.get<{ id: number }>("SELECT id FROM policy_versions WHERE version = ?", ["rules_v1"]);
     if (existing) return;
+    const weightsJson = JSON.stringify({ quality: 0.35, valuation: 0.2, momentum: 0.25, risk: 0.2 });
+    const metricsJson = JSON.stringify({ seed: true });
+    const notes = "Initial deterministic policy weights";
+    const createdAt = new Date().toISOString();
     await db.run(
       `INSERT INTO policy_versions (version, weightsJson, metricsJson, notes, createdAt)
        VALUES (?, ?, ?, ?, ?)`,
-      [
-        "rules_v1",
-        JSON.stringify({ quality: 0.35, valuation: 0.2, momentum: 0.25, risk: 0.2 }),
-        JSON.stringify({ seed: true }),
-        "Initial deterministic policy weights",
-        new Date().toISOString(),
-      ]
+      ["rules_v1", weightsJson, metricsJson, notes, createdAt]
     );
+    if (pgMirror) {
+      fireMirror("policy_seed", pgMirror.upsertPolicyVersion("rules_v1", weightsJson, metricsJson, notes, createdAt));
+    }
   }
 
   await ensureInitialPolicyVersion();
@@ -1170,6 +1239,7 @@ async function startServer() {
   }
 
   async function saveRecommendation(rec: RecommendationDecision) {
+    const createdAt = new Date().toISOString();
     const inserted = await db.run(
       `INSERT INTO recommendations
        (reportId, symbol, country, recommendationAction, confidencePct, horizonDays, riskClass, explainabilityJson, scoreSnapshotJson, policyVersion, createdAt)
@@ -1185,9 +1255,13 @@ async function startServer() {
         JSON.stringify(rec.explainability),
         JSON.stringify(rec.scoreSnapshot),
         rec.policyVersion,
-        new Date().toISOString(),
+        createdAt,
       ]
     );
+    const rid = Number(inserted.lastID);
+    if (pgMirror && rid) {
+      fireMirror("recommendation", pgMirror.insertRecommendation(rid, rec, createdAt));
+    }
     return inserted.lastID;
   }
 
@@ -1213,6 +1287,50 @@ async function startServer() {
         job.finishedAt,
       ]
     );
+    if (pgMirror) {
+      fireMirror("job", pgMirror.upsertJob(job));
+    }
+  }
+
+  async function updateGenericJobRow(input: {
+    id: string;
+    type: string;
+    status: "queued" | "running" | "completed" | "failed";
+    payload: unknown;
+    result?: unknown;
+    error?: string;
+    createdAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
+  }) {
+    await db.run(
+      `INSERT INTO jobs (id, type, status, inputJson, resultJson, error, createdAt, startedAt, finishedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         status=excluded.status,
+         resultJson=excluded.resultJson,
+         error=excluded.error,
+         startedAt=excluded.startedAt,
+         finishedAt=excluded.finishedAt`,
+      [
+        input.id,
+        input.type,
+        input.status,
+        JSON.stringify(input.payload || {}),
+        input.result ? JSON.stringify(input.result) : null,
+        input.error || null,
+        input.createdAt,
+        input.startedAt,
+        input.finishedAt,
+      ]
+    );
+  }
+
+  async function mirrorStrategyPerfCacheRow(symbol: string, startDate: string, payloadJson: string, createdAt: string) {
+    if (!pgMirror) return;
+    const row = await db.get<{ id: number }>("SELECT id FROM strategy_perf_cache WHERE symbol = ? AND startDate = ?", [symbol, startDate]);
+    if (!row?.id) return;
+    fireMirror("strategy_cache", pgMirror.upsertStrategyPerfCache(row.id, symbol, startDate, payloadJson, createdAt));
   }
 
   async function computeForwardOutcomeForReport(input: {
@@ -1303,7 +1421,8 @@ async function startServer() {
            LIMIT 1`,
           [row.id]
         );
-        await db.run(
+        const outcomeNow = new Date().toISOString();
+        const outcomeInsert = await db.run(
           `INSERT INTO report_outcomes
            (recommendationId, reportId, symbol, country, horizonDays, reportDate, entryDate, entryPrice, targetDate, targetPrice, returnPct, status, createdAt, updatedAt)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1332,10 +1451,32 @@ async function startServer() {
             targetPrice,
             returnPct,
             status,
-            new Date().toISOString(),
-            new Date().toISOString(),
+            outcomeNow,
+            outcomeNow,
           ]
         );
+        const oid = Number(outcomeInsert.lastID);
+        if (pgMirror && oid) {
+          fireMirror(
+            "report_outcome",
+            pgMirror.upsertReportOutcome(oid, {
+              recommendationId: recommendation?.id || null,
+              reportId: row.id,
+              symbol: row.symbol,
+              country: normalizedCountry,
+              horizonDays,
+              reportDate: row.createdAt,
+              entryDate,
+              entryPrice,
+              targetDate,
+              targetPrice,
+              returnPct,
+              status,
+              createdAt: outcomeNow,
+              updatedAt: outcomeNow,
+            })
+          );
+        }
         refreshed += 1;
       }
     }
@@ -1401,17 +1542,18 @@ async function startServer() {
       risk: Number(riskBias.toFixed(3)),
     };
     const version = `rules_v${Date.now()}`;
+    const policyCreatedAt = new Date().toISOString();
+    const weightsJson = JSON.stringify(weights);
+    const metricsJson = JSON.stringify({ calibration });
+    const policyNotes = "Automated rules-first reweighting based on realized outcomes";
     await db.run(
       `INSERT INTO policy_versions (version, weightsJson, metricsJson, notes, createdAt)
        VALUES (?, ?, ?, ?, ?)`,
-      [
-        version,
-        JSON.stringify(weights),
-        JSON.stringify({ calibration }),
-        "Automated rules-first reweighting based on realized outcomes",
-        new Date().toISOString(),
-      ]
+      [version, weightsJson, metricsJson, policyNotes, policyCreatedAt]
     );
+    if (pgMirror) {
+      fireMirror("policy_job", pgMirror.upsertPolicyVersion(version, weightsJson, metricsJson, policyNotes, policyCreatedAt));
+    }
     return { version, weights, calibration };
   }
 
@@ -1441,6 +1583,51 @@ async function startServer() {
       await updateJobRow(job);
     }
     outcomeWorkerRunning = false;
+  }
+
+  async function drainValidationQueue() {
+    if (validationWorkerRunning) return;
+    validationWorkerRunning = true;
+    while (validationQueue.length) {
+      const jobId = validationQueue.shift() as string;
+      const job = validationJobs.get(jobId);
+      if (!job) continue;
+      job.status = "running";
+      job.startedAt = new Date().toISOString();
+      await updateGenericJobRow({
+        id: job.id,
+        type: "intelligence_validation_refresh",
+        status: job.status,
+        payload: job.input,
+        result: job.result,
+        error: job.error,
+        createdAt: job.createdAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+      });
+      try {
+        job.result = await runValidationSweep(db as any, job.input);
+        job.status = "completed";
+        job.finishedAt = new Date().toISOString();
+      } catch (e: unknown) {
+        job.status = "failed";
+        job.error = e instanceof Error ? e.message : "validation_queue_failed";
+        job.finishedAt = new Date().toISOString();
+      }
+      validationJobs.set(job.id, job);
+      await updateGenericJobRow({
+        id: job.id,
+        type: "intelligence_validation_refresh",
+        status: job.status,
+        payload: job.input,
+        result: job.result,
+        error: job.error,
+        createdAt: job.createdAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+      });
+    }
+    validationWorkerRunning = false;
   }
 
   // Background Sync Function
@@ -1621,6 +1808,33 @@ async function startServer() {
     });
   }, 24 * 60 * 60 * 1000);
 
+  // Periodic validation refresh for recent result announcements
+  setInterval(() => {
+    const jobId = `val_sched_${Date.now()}`;
+    const job: ValidationRefreshJob = {
+      id: jobId,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      status: "queued",
+      input: { limit: 20, type: "results" },
+    };
+    validationJobs.set(jobId, job);
+    validationQueue.push(jobId);
+    void updateGenericJobRow({
+      id: job.id,
+      type: "intelligence_validation_refresh",
+      status: job.status,
+      payload: job.input,
+      result: job.result,
+      error: job.error,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+    });
+    void drainValidationQueue();
+  }, 30 * 60 * 1000);
+
   // API Routes
   app.get("/api/health", (req, res) => {
     res.json({ 
@@ -1798,6 +2012,122 @@ async function startServer() {
     } catch (error: any) {
       console.error("Error fetching announcements:", error.message);
       res.status(500).json({ success: false, error: "Failed to fetch announcements" });
+    }
+  });
+
+  app.post("/api/documents/process", async (req, res) => {
+    try {
+      const limitRaw = Number((req.body as any)?.limit ?? req.query.limit ?? 25);
+      const typeRaw = String((req.body as any)?.type ?? req.query.type ?? "all").toLowerCase();
+      const type = typeRaw === "results" ? "results" : "all";
+      const result = await processAnnouncementDocuments(db as any, { limit: limitRaw, type });
+      return res.json({ success: true, data: result });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "document_processing_failed" });
+    }
+  });
+
+  app.get("/api/documents/intelligence", async (req, res) => {
+    try {
+      const limitRaw = Number(req.query.limit || 50);
+      const limit = Math.max(1, Math.min(limitRaw, 500));
+      const rows = await db.all(
+        `SELECT announcementId, symbol, exchange, pdfUrl, contentSha256, docCategory, textSnippet, status, error, processedAt
+         FROM document_intelligence
+         ORDER BY datetime(processedAt) DESC
+         LIMIT ?`,
+        [limit]
+      );
+      return res.json({ success: true, data: rows });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "document_intelligence_fetch_failed" });
+    }
+  });
+
+  app.get("/api/announcements/validate-intelligence", async (req, res) => {
+    try {
+      const id = String(req.query.id || "").trim();
+      const screenerUrl = req.query.screenerUrl ? String(req.query.screenerUrl) : undefined;
+      if (!id) return res.status(400).json({ success: false, error: "id is required" });
+      const payload = await validateAnnouncementIntelligence(db as any, id, screenerUrl);
+      if (!payload) return res.status(404).json({ success: false, error: "announcement_not_found" });
+      const normalized = normalizeIntelligenceValidationResult(payload);
+      if (!normalized) return res.status(500).json({ success: false, error: "validation_contract_invalid" });
+      return res.json({ success: true, data: normalized });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "intelligence_validation_failed" });
+    }
+  });
+
+  app.post("/api/announcements/validate-intelligence/refresh", requireAdmin, async (req, res) => {
+    try {
+      const limitRaw = Number(req.body?.limit ?? req.query.limit ?? 20);
+      const typeRaw = String(req.body?.type ?? req.query.type ?? "results").toLowerCase();
+      const asyncMode = String(req.body?.async ?? req.query.async ?? "true").toLowerCase() !== "false";
+      const input: ValidationRefreshJob["input"] = {
+        limit: Math.max(1, Math.min(limitRaw, 300)),
+        type: typeRaw === "all" ? "all" : "results",
+        screenerUrl: req.body?.screenerUrl ? String(req.body.screenerUrl) : undefined,
+      };
+      if (!asyncMode) {
+        const result = await runValidationSweep(db as any, input);
+        return res.json({ success: true, data: { mode: "sync", result } });
+      }
+      const jobId = `val_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const job: ValidationRefreshJob = {
+        id: jobId,
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: null,
+        status: "queued",
+        input,
+      };
+      validationJobs.set(jobId, job);
+      validationQueue.push(jobId);
+      await updateGenericJobRow({
+        id: job.id,
+        type: "intelligence_validation_refresh",
+        status: job.status,
+        payload: job.input,
+        result: job.result,
+        error: job.error,
+        createdAt: job.createdAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+      });
+      void drainValidationQueue();
+      return res.json({ success: true, data: { mode: "async", jobId } });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "validation_refresh_failed" });
+    }
+  });
+
+  app.get("/api/announcements/validate-intelligence/jobs/:jobId", requireAdmin, (req, res) => {
+    const jobId = String(req.params.jobId || "");
+    const inMemory = validationJobs.get(jobId);
+    if (inMemory) return res.json({ success: true, data: inMemory });
+    return res.status(404).json({ success: false, error: "job_not_found" });
+  });
+
+  app.get("/api/announcements/validation-runs", requireAdmin, async (req, res) => {
+    try {
+      const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 500));
+      const rows = await db.all(
+        `SELECT id, announcementId, symbol, exchange, verdict, reasonsJson, nseMatched, bseMatched, screenerMatched, driftScore, mismatchSeverity, createdAt
+         FROM validation_runs
+         ORDER BY datetime(createdAt) DESC
+         LIMIT ?`,
+        [limit]
+      );
+      return res.json({
+        success: true,
+        data: rows.map((r: any) => ({
+          ...r,
+          reasons: JSON.parse(r.reasonsJson || "[]"),
+        })),
+      });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "validation_runs_fetch_failed" });
     }
   });
 
@@ -2419,7 +2749,10 @@ async function startServer() {
           if (entryIdx < 0 || lastIdx < 0) {
             const out = { symbol, entryDate: null, entryPrice: null, lastDate: null, lastPrice: null, returnPct: null, error: "no_data" };
             rows.push(out);
-            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+            const ca = new Date().toISOString();
+            const payloadJson = JSON.stringify(out);
+            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, payloadJson, ca]);
+            await mirrorStrategyPerfCacheRow(symbol, startDate, payloadJson, ca);
           } else {
             const entryPrice = Number(closes[entryIdx]);
             const lastPrice = Number(closes[lastIdx]);
@@ -2432,12 +2765,18 @@ async function startServer() {
               returnPct: entryPrice > 0 ? ((lastPrice / entryPrice) - 1) * 100 : null,
             };
             rows.push(out);
-            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+            const ca = new Date().toISOString();
+            const payloadJson = JSON.stringify(out);
+            await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, payloadJson, ca]);
+            await mirrorStrategyPerfCacheRow(symbol, startDate, payloadJson, ca);
           }
         } catch (e: any) {
           const out = { symbol, entryDate: null, entryPrice: null, lastDate: null, lastPrice: null, returnPct: null, error: e.message || "fetch_failed" };
           rows.push(out);
-          await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, JSON.stringify(out), new Date().toISOString()]);
+          const ca = new Date().toISOString();
+          const payloadJson = JSON.stringify(out);
+          await db.run("INSERT OR REPLACE INTO strategy_perf_cache (symbol, startDate, payloadJson, createdAt) VALUES (?, ?, ?, ?)", [symbol, startDate, payloadJson, ca]);
+          await mirrorStrategyPerfCacheRow(symbol, startDate, payloadJson, ca);
         }
       }
       const ok = rows.filter((r) => r.returnPct != null);
@@ -2629,6 +2968,7 @@ async function startServer() {
       if (!actionType) return res.status(400).json({ success: false, error: "action_type_required" });
       const row = await db.get<{ id: number }>("SELECT id FROM recommendations WHERE id = ?", [recommendationId]);
       if (!row) return res.status(404).json({ success: false, error: "recommendation_not_found" });
+      const actionCreatedAt = new Date().toISOString();
       const inserted = await db.run(
         `INSERT INTO recommendation_actions
          (recommendationId, actionType, actorType, actorId, executionPrice, executionDate, sizeValue, notes, createdAt)
@@ -2642,9 +2982,26 @@ async function startServer() {
           req.body?.executionDate ? String(req.body.executionDate) : null,
           req.body?.sizeValue != null ? Number(req.body.sizeValue) : null,
           req.body?.notes ? String(req.body.notes) : null,
-          new Date().toISOString(),
+          actionCreatedAt,
         ]
       );
+      const aid = Number(inserted.lastID);
+      if (pgMirror && aid) {
+        fireMirror(
+          "recommendation_action",
+          pgMirror.insertRecommendationAction(aid, {
+            recommendationId,
+            actionType,
+            actorType,
+            actorId: req.body?.actorId ? String(req.body.actorId) : null,
+            executionPrice: req.body?.executionPrice != null ? Number(req.body.executionPrice) : null,
+            executionDate: req.body?.executionDate ? String(req.body.executionDate) : null,
+            sizeValue: req.body?.sizeValue != null ? Number(req.body.sizeValue) : null,
+            notes: req.body?.notes ? String(req.body.notes) : null,
+            createdAt: actionCreatedAt,
+          })
+        );
+      }
       return res.json({ success: true, data: { id: inserted.lastID } });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "recommendation_action_failed" });
@@ -2809,6 +3166,8 @@ async function startServer() {
         ? req.body.invalidationTriggers.map((t: unknown) => String(t).trim()).filter(Boolean)
         : [];
       if (!symbol || !thesis) return res.status(400).json({ success: false, error: "symbol_and_thesis_required" });
+      const thesisNow = new Date().toISOString();
+      const triggersJson = JSON.stringify(triggers);
       await db.run(
         `INSERT INTO company_thesis_memory
          (symbol, country, thesis, invalidationTriggersJson, status, invalidatedReason, invalidatedAt, createdAt, updatedAt)
@@ -2820,8 +3179,21 @@ async function startServer() {
            invalidatedReason=NULL,
            invalidatedAt=NULL,
            updatedAt=excluded.updatedAt`,
-        [symbol, country, thesis, JSON.stringify(triggers), new Date().toISOString(), new Date().toISOString()]
+        [symbol, country, thesis, triggersJson, thesisNow, thesisNow]
       );
+      if (pgMirror) {
+        fireMirror(
+          "thesis",
+          pgMirror.upsertThesis({
+            symbol,
+            country,
+            thesis,
+            triggersJson,
+            createdAt: thesisNow,
+            updatedAt: thesisNow,
+          })
+        );
+      }
       return res.json({ success: true, data: { symbol, country, thesis, invalidationTriggers: triggers } });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "thesis_save_failed" });
@@ -2834,13 +3206,18 @@ async function startServer() {
       const country = String(req.body?.country || "IN").trim().toUpperCase() === "US" ? "US" : "IN";
       const reason = String(req.body?.reason || "manual_invalidation").trim();
       if (!symbol) return res.status(400).json({ success: false, error: "symbol_required" });
+      const invAt = new Date().toISOString();
+      const updAt = new Date().toISOString();
       const updated = await db.run(
         `UPDATE company_thesis_memory
          SET status = 'invalidated', invalidatedReason = ?, invalidatedAt = ?, updatedAt = ?
          WHERE symbol = ? AND country = ?`,
-        [reason, new Date().toISOString(), new Date().toISOString(), symbol, country]
+        [reason, invAt, updAt, symbol, country]
       );
       if (!updated.changes) return res.status(404).json({ success: false, error: "thesis_not_found" });
+      if (pgMirror) {
+        fireMirror("thesis_invalidate", pgMirror.invalidateThesis(symbol, country, reason, invAt, updAt));
+      }
       return res.json({ success: true, data: { symbol, country, reason } });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "thesis_invalidate_failed" });
@@ -2892,10 +3269,13 @@ async function startServer() {
     }
   });
 
-  app.get("/api/metrics", requireAdmin, async (_req, res) => {
+  async function buildAdminMetricsSnapshot() {
     const queueDepth = outcomeQueue.length;
+    const validationQueueDepth = validationQueue.length;
     const runningJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "running").length;
     const queuedJobs = Array.from(outcomeJobs.values()).filter((j) => j.status === "queued").length;
+    const runningValidationJobs = Array.from(validationJobs.values()).filter((j) => j.status === "running").length;
+    const queuedValidationJobs = Array.from(validationJobs.values()).filter((j) => j.status === "queued").length;
     const persistedJobs = await db.get<{ total: number; queued: number; running: number; failed: number; completed: number }>(
       `SELECT
          COUNT(*) as total,
@@ -2905,17 +3285,77 @@ async function startServer() {
          SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as completed
        FROM jobs`
     );
-    return res.json({
-      success: true,
-      data: {
-        ...metrics,
-        queueDepth,
-        runningJobs,
-        queuedJobs,
-        persistedJobs: persistedJobs || { total: 0, queued: 0, running: 0, failed: 0, completed: 0 },
-        asOf: new Date().toISOString(),
+    const calibration = await computeRecommendationCalibration(180);
+    const validationSummary = await db.get<{
+      total: number;
+      passed: number;
+      warned: number;
+      failed: number;
+      drifted: number;
+    }>(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END) as passed,
+         SUM(CASE WHEN verdict='warn' THEN 1 ELSE 0 END) as warned,
+         SUM(CASE WHEN verdict='fail' THEN 1 ELSE 0 END) as failed,
+         SUM(CASE WHEN driftScore > 0 THEN 1 ELSE 0 END) as drifted
+       FROM validation_runs
+       WHERE datetime(createdAt) >= datetime('now', '-7 days')`
+    );
+    return {
+      ...metrics,
+      queueDepth,
+      validationQueueDepth,
+      runningJobs,
+      queuedJobs,
+      runningValidationJobs,
+      queuedValidationJobs,
+      persistedJobs: persistedJobs || { total: 0, queued: 0, running: 0, failed: 0, completed: 0 },
+      validationSummary7d: validationSummary || { total: 0, passed: 0, warned: 0, failed: 0, drifted: 0 },
+      decisionMetrics: {
+        windowDays: calibration.windowDays,
+        sampleCount: calibration.sampleCount,
+        brierLikeScore: calibration.brierLikeScore,
+        buckets: calibration.buckets,
       },
-    });
+      postgresDualWrite: Boolean(pgMirror),
+      asOf: new Date().toISOString(),
+    };
+  }
+
+  app.get("/api/metrics", requireAdmin, async (_req, res) => {
+    const data = await buildAdminMetricsSnapshot();
+    return res.json({ success: true, data });
+  });
+
+  app.get("/api/metrics/dashboard", requireAdmin, async (_req, res) => {
+    const data = await buildAdminMetricsSnapshot();
+    const body = JSON.stringify(data, null, 2)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;");
+    return res
+      .type("html")
+      .send(
+        `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>EQR operational metrics</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.75rem; }
+    p { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1rem; }
+    pre { background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 1rem; overflow: auto; font-size: 0.8rem; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <h1>Operational metrics (admin)</h1>
+  <p>Same payload as <code>GET /api/metrics</code> including decision calibration. Use for on-call / Grafana JSON API checks.</p>
+  <pre>${body}</pre>
+</body>
+</html>`
+      );
   });
 
   app.get("/api/portfolio/holding-metrics", async (req, res) => {

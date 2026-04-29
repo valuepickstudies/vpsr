@@ -9,19 +9,20 @@
 
 ## SQLite to Postgres Migration Path
 
-1. **Schema parity:** mirror `announcements`, `saved_reports`, `report_outcomes`, `recommendations`, `recommendation_actions`, `policy_versions`, `jobs`, `company_thesis_memory`, and cache tables in Postgres.
-2. **Dual-write phase:** write to SQLite and Postgres for operational endpoints, compare row counts/checksums daily.
+1. **Schema parity:** `sql/postgres-schema.sql` mirrors `announcements`, `saved_reports`, `report_outcomes`, `recommendations`, `recommendation_actions`, `policy_versions`, `jobs`, `company_thesis_memory`, and `strategy_perf_cache`. Applied automatically on startup when `POSTGRES_URL` is set (otherwise SQLite-only).
+2. **Dual-write phase:** With `POSTGRES_URL`, the server dual-writes the same rows as SQLite for those tables (best-effort; failures are logged and do not block the primary write). Compare row counts/checksums daily before cutover.
 3. **Read shadowing:** compare sampled Postgres reads against SQLite results.
 4. **Cutover:** switch reads to Postgres behind an env flag.
 5. **Rollback plan:** preserve SQLite writes for one release window.
 
 ## Metrics and Alerting
 
-- Metrics endpoint: `GET /api/metrics` (`x-admin-key` required).
+- Metrics endpoint: `GET /api/metrics` (`x-admin-key` required). Includes `decisionMetrics` (180d calibration: `sampleCount`, `brierLikeScore`, per-confidence `buckets`) and `postgresDualWrite` when the mirror is active.
+- HTML dashboard: `GET /api/metrics/dashboard` (same auth) for a quick on-call view of the same JSON payload.
 - Track at minimum:
   - `requestsTotal`, `errorsTotal`, `avgLatencyMs`
   - `queueEnqueued`, `queueCompleted`, `queueFailed`, queue depth
-  - Decision metrics: recommendation calibration sample count, brier-like score, and per-band hit-rate
+  - Decision metrics: as above, embedded in `data.decisionMetrics`
 - Recommended alerts:
   - Error rate > 5% over 5 minutes
   - Queue depth > 25 for 10 minutes

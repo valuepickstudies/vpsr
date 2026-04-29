@@ -24,7 +24,7 @@ This tracker converts the review into implementation checkpoints with ownership 
 
 ## Phase 3 - Moat Features
 
-- [~] Outcome tracking foundations:
+- [x] Outcome tracking foundations:
   - [x] `report_outcomes` table and persistence
   - [x] Refresh endpoint to compute 30/90/180d outcomes from saved reports
   - [x] Aggregate hit-rate/avg-return endpoint
@@ -36,14 +36,16 @@ This tracker converts the review into implementation checkpoints with ownership 
 ## Phase 4 - Platform and Scale
 
 - [x] Queue/background job split for ingestion and heavy analytics
-- [x] SQLite -> Postgres migration path (schema and dual-write strategy)
-- [x] Production metrics + alerting dashboards
+- [x] SQLite → Postgres migration path: `sql/postgres-schema.sql`, optional `POSTGRES_URL` dual-write mirror (`server/postgresMirror.ts`) for operational tables; compare row counts before cutover.
+- [x] Production metrics + operational dashboard: `GET /api/metrics` (includes queue + decision calibration fields) and `GET /api/metrics/dashboard` (HTML view; both require `x-admin-key`). Wire external alerting to the JSON metrics endpoint.
 - [x] Hardened backend authz around sensitive operations
 
 ## Verification Gates
 
 - Lint: `npm run lint`
 - Tests: `npm run test:core`
+- Optional: set `POSTGRES_URL` and confirm dual-write logs (`[PG]`) without errors.
 - Manual API checks:
   - `POST /api/reports/outcomes/refresh`
   - `GET /api/reports/outcomes?horizonDays=90`
+  - `GET /api/metrics` and `GET /api/metrics/dashboard` (with `x-admin-key`)
