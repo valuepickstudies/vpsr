@@ -33,7 +33,7 @@ export default function SnapshotModal({ open, loading, snapshotData, onClose }: 
                 <Sparkles className="h-5 w-5" />
                 <h3 className="font-bold">Quick Result Snapshot</h3>
               </div>
-              <button onClick={onClose} className="text-white/80 hover:text-white transition-colors">
+              <button onClick={onClose} aria-label="Close snapshot modal" className="text-white/80 hover:text-white transition-colors">
                 <RefreshCw className="h-5 w-5 rotate-45" />
               </button>
             </div>

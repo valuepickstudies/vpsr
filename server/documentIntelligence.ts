@@ -81,6 +81,22 @@ function classifyDocument(subject: string, category: string): string {
   return "general";
 }
 
+function isResultLikeAnnouncement(subject: string, category: string): boolean {
+  const text = `${subject} ${category}`.toLowerCase();
+  return (
+    text.includes("result") ||
+    text.includes("financial") ||
+    text.includes("quarter") ||
+    text.includes("q1") ||
+    text.includes("q2") ||
+    text.includes("q3") ||
+    text.includes("q4") ||
+    text.includes("earnings") ||
+    text.includes("audited") ||
+    text.includes("unaudited")
+  );
+}
+
 function toYmd(value: string): string {
   const ts = Date.parse(value);
   if (!Number.isFinite(ts)) return "";
@@ -138,7 +154,11 @@ export async function processAnnouncementDocuments(db: DbLike, options?: { limit
   const rows = await db.all(
     type === "results"
       ? `SELECT id, symbol, companyName, subject, date, pdfLink, exchange, category
-         FROM announcements WHERE category = 'Result'
+         FROM announcements
+         WHERE category = 'Result'
+            OR lower(subject) LIKE '%result%'
+            OR lower(subject) LIKE '%financial%'
+            OR lower(subject) LIKE '%quarter%'
          ORDER BY date DESC LIMIT ?`
       : `SELECT id, symbol, companyName, subject, date, pdfLink, exchange, category
          FROM announcements ORDER BY date DESC LIMIT ?`,
@@ -150,6 +170,10 @@ export async function processAnnouncementDocuments(db: DbLike, options?: { limit
   let failed = 0;
   let skipped = 0;
   for (const row of rows as AnnouncementRow[]) {
+    if (type === "results" && !isResultLikeAnnouncement(row.subject || "", row.category || "")) {
+      skipped += 1;
+      continue;
+    }
     processed += 1;
     const docCategory = classifyDocument(row.subject || "", row.category || "");
     if (!row.pdfLink) {

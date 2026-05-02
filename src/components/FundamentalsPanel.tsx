@@ -13,7 +13,7 @@ export default function FundamentalsPanel({ companyData }: FundamentalsPanelProp
         <h3 className="text-lg font-semibold text-gray-900 mb-4">Key Fundamentals</h3>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           {(companyData.fundamentals || []).map((item, idx) => (
-            <div key={idx} className="bg-gray-50 p-4 rounded-lg border border-gray-100">
+            <div key={idx} className="bg-gray-50 p-4 rounded-lg border border-gray-200">
               <div className="text-sm text-gray-500 mb-1">{item.label || "Metric"}</div>
               <div className="text-lg font-semibold text-gray-900">{item.value}</div>
             </div>
@@ -24,7 +24,7 @@ export default function FundamentalsPanel({ companyData }: FundamentalsPanelProp
       {companyData.about && (
         <div>
           <h3 className="text-lg font-semibold text-gray-900 mb-3">About Company</h3>
-          <div className="bg-gray-50 p-5 rounded-lg border border-gray-100 text-gray-700 leading-relaxed text-sm">
+          <div className="bg-gray-50 p-5 rounded-lg border border-gray-200 text-gray-700 leading-relaxed text-sm">
             {companyData.about}
           </div>
         </div>

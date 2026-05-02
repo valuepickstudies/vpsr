@@ -1,6 +1,87 @@
 import * as cheerio from "cheerio";
 import type { CompanyReportData, QualityGateResult, ReportChartRow, ReportQuarterlyRow } from "./shared/reportTypes";
 
+/** Parses calendar year from Screener period labels like "Mar 2026", "2024", "FY2025" (FY has no word boundary before digits). */
+export function extractYearFromPeriodLabel(label: string): number {
+  const s = String(label || "").trim();
+  const fy = s.match(/FY\s*(19\d{2}|20\d{2})/i);
+  if (fy) return Number(fy[1]);
+  const m = s.match(/\b(19\d{2}|20\d{2})\b/);
+  if (m) return Number(m[0]);
+  return new Date().getFullYear();
+}
+
+/** Wilder's RSI aligned by candle index; null until period bars allow a reading. */
+export function computeWildersRSI(closes: number[], period = 14): (number | null)[] {
+  const rsi: (number | null)[] = closes.map(() => null);
+  if (closes.length < period + 1) return rsi;
+  const changes: number[] = [];
+  for (let i = 1; i < closes.length; i++) {
+    changes.push(closes[i] - closes[i - 1]);
+  }
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 0; i < period; i++) {
+    const ch = changes[i];
+    if (ch >= 0) avgGain += ch;
+    else avgLoss -= ch;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  const rs0 = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  rsi[period] = rs0;
+  let avgG = avgGain;
+  let avgL = avgLoss;
+  for (let i = period; i < changes.length; i++) {
+    const ch = changes[i];
+    const gain = ch > 0 ? ch : 0;
+    const loss = ch < 0 ? -ch : 0;
+    avgG = (avgG * (period - 1) + gain) / period;
+    avgL = (avgL * (period - 1) + loss) / period;
+    const idx = i + 1;
+    rsi[idx] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  }
+  return rsi;
+}
+
+function clampNumber(v: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, v));
+}
+
+/** 3-year forward projection from recent annual rows; labels use fiscal year parsed from Screener columns. */
+export function buildFutureProjectionRows(chartData: ReportChartRow[]): Array<{ year: string; sales: number; netProfit: number }> {
+  const rows = (chartData || []).slice(-4).map((r) => ({
+    year: String(r.year),
+    sales: Number(r.sales) || 0,
+    netProfit: Number(r.netProfit) || 0,
+  })).filter((r) => Number.isFinite(r.sales) && Number.isFinite(r.netProfit));
+  if (rows.length < 2) return [];
+  const salesGrowth = rows.slice(1).map((r, i) => (rows[i].sales > 0 ? r.sales / rows[i].sales - 1 : 0));
+  const profitGrowth = rows.slice(1).map((r, i) =>
+    rows[i].netProfit !== 0 ? r.netProfit / rows[i].netProfit - 1 : 0
+  );
+  const avgSalesGrowth = salesGrowth.length ? salesGrowth.reduce((a, b) => a + b, 0) / salesGrowth.length : 0;
+  const avgProfitGrowth = profitGrowth.length ? profitGrowth.reduce((a, b) => a + b, 0) / profitGrowth.length : 0;
+  const last = rows[rows.length - 1];
+  const baseYear = extractYearFromPeriodLabel(last.year);
+  let s = last.sales;
+  let p = last.netProfit;
+  const out: Array<{ year: string; sales: number; netProfit: number }> = [];
+  for (let i = 1; i <= 3; i++) {
+    s = s * (1 + clampNumber(avgSalesGrowth, -0.2, 0.35));
+    p = p * (1 + clampNumber(avgProfitGrowth, -0.3, 0.4));
+    const sy = Number(s.toFixed(2));
+    const py = Number(p.toFixed(2));
+    if (!Number.isFinite(sy) || !Number.isFinite(py)) continue;
+    out.push({
+      year: `Mar ${baseYear + i} (proj)`,
+      sales: sy,
+      netProfit: py,
+    });
+  }
+  return out;
+}
+
 function parseTableSeriesByLabels(
   $: cheerio.CheerioAPI,
   sectionSelector: string,

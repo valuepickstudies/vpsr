@@ -70,10 +70,10 @@ export default function ReportChartsSection(props: ReportChartsSectionProps) {
       </div>
 
       <div ref={chartsRef} className="grid grid-cols-1 lg:grid-cols-2 gap-6 bg-gray-50 p-4 rounded-xl -mx-4 sm:mx-0">
-        <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
+        <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
           {!isPaidCustomer && (
             <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center">
-              <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-100 max-w-xs">
+              <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-200 max-w-xs">
                 <div className="w-12 h-12 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
                   <Sparkles className="h-6 w-6 text-amber-600" />
                 </div>
@@ -108,7 +108,7 @@ export default function ReportChartsSection(props: ReportChartsSectionProps) {
           </div>
         </div>
 
-        <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
+        <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
           {!isPaidCustomer && (
             <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center" />
           )}
@@ -124,7 +124,7 @@ export default function ReportChartsSection(props: ReportChartsSectionProps) {
                 <YAxis axisLine={false} tickLine={false} tickCount={5} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
                 <Tooltip contentStyle={{ borderRadius: "12px", border: "none", boxShadow: "0 10px 15px -3px rgb(0 0 0 / 0.1)" }} />
                 <Legend wrapperStyle={{ paddingTop: "20px" }} iconType="circle" />
-                <Line type="monotone" dataKey="eps" name="EPS (Rs)" stroke={activeChartPalette.eps} strokeWidth={3} dot={{ r: 4, fill: activeChartPalette.eps, strokeWidth: 0 }} activeDot={{ r: 6 }} isAnimationActive={false}>
+                <Line type="monotone" dataKey="eps" name={country === "US" ? "EPS (USD)" : "EPS (₹)"} stroke={activeChartPalette.eps} strokeWidth={3} dot={{ r: 4, fill: activeChartPalette.eps, strokeWidth: 0 }} activeDot={{ r: 6 }} isAnimationActive={false}>
                   <LabelList dataKey="eps" position="top" offset={12} style={{ fontSize: "10px", fill: "#94A3B8", fontWeight: 600 }} />
                 </Line>
               </LineChart>
@@ -133,49 +133,60 @@ export default function ReportChartsSection(props: ReportChartsSectionProps) {
         </div>
       </div>
 
-      <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
-        {!isPaidCustomer && (
-          <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center">
-            <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-100 max-w-xs">
-              <h4 className="text-lg font-bold text-gray-900 mb-2">Premium Feature</h4>
-              <p className="text-sm text-gray-600 mb-4">Upgrade to unlock advanced technical movement view.</p>
-              <button onClick={() => setIsPaidCustomer(true)} className="w-full py-2 bg-amber-600 text-white rounded-lg font-bold text-sm hover:bg-amber-700 transition-colors">
-                Unlock Now
-              </button>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 bg-gray-50 p-4 rounded-xl -mx-4 sm:mx-0">
+        <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden flex flex-col min-h-0">
+          {!isPaidCustomer && (
+            <div className="absolute inset-0 z-10 bg-white/40 backdrop-blur-sm flex items-center justify-center p-6 text-center">
+              <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-200 max-w-xs">
+                <h4 className="text-lg font-bold text-gray-900 mb-2">Premium Feature</h4>
+                <p className="text-sm text-gray-600 mb-4">Upgrade to unlock advanced technical movement view.</p>
+                <button onClick={() => setIsPaidCustomer(true)} className="w-full py-2 bg-amber-600 text-white rounded-lg font-bold text-sm hover:bg-amber-700 transition-colors">
+                  Unlock Now
+                </button>
+              </div>
             </div>
+          )}
+          <h3 className="text-base font-semibold text-gray-800 mb-2 flex items-center gap-2 shrink-0">
+            <Radar className="h-5 w-5 text-cyan-500" />
+            Technical Price Movement
+          </h3>
+          <p className="text-xs text-gray-500 mb-4 shrink-0">Daily OHLC candles; hover for prices; zoom (+/−) and pan (◀/▶) when magnified; ranges 3M–5Y with price-action dots.</p>
+          <div className="flex-1 min-h-0">
+            <TechnicalCandlestickChart
+              candles={rangedCandles}
+              markers={priceActionMarkers}
+              isLoading={loadingPriceCandles}
+              range={technicalRange}
+              onRangeChange={setTechnicalRange}
+            />
           </div>
-        )}
-        <h3 className="text-base font-semibold text-gray-800 mb-2 flex items-center gap-2">
-          <Radar className="h-5 w-5 text-cyan-500" />
-          Technical Price Movement
-        </h3>
-        <p className="text-xs text-gray-500 mb-4">Daily candlesticks across 3M / 6M / 1Y / 3Y / 5Y with price-action markings.</p>
-        <TechnicalCandlestickChart
-          candles={rangedCandles}
-          markers={priceActionMarkers}
-          isLoading={loadingPriceCandles}
-          range={technicalRange}
-          onRangeChange={setTechnicalRange}
-        />
-      </div>
+        </div>
 
-      <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden">
-        <h3 className="text-base font-semibold text-gray-800 mb-6 flex items-center gap-2">
-          <TrendingUp className="h-5 w-5 text-indigo-500" />
-          Future Projections (3Y)
-        </h3>
-        <div className="h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={projectionRows} margin={{ top: 20, right: 10, left: -20, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F3F4F6" />
-              <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
-              <YAxis axisLine={false} tickLine={false} tickCount={5} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
-              <Tooltip contentStyle={{ borderRadius: "12px", border: "none", boxShadow: "0 10px 15px -3px rgb(0 0 0 / 0.1)" }} />
-              <Legend wrapperStyle={{ paddingTop: "20px" }} iconType="circle" />
-              <Line type="monotone" dataKey="sales" name="Projected Sales" stroke={activeChartPalette.projection} strokeWidth={2.5} dot={{ r: 3 }} isAnimationActive={false} />
-              <Line type="monotone" dataKey="netProfit" name="Projected Net Profit" stroke={activeChartPalette.profit} strokeWidth={2.5} dot={{ r: 3 }} isAnimationActive={false} />
-            </LineChart>
-          </ResponsiveContainer>
+        <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-[0_8px_30px_rgb(0,0,0,0.04)] relative overflow-hidden flex flex-col min-h-0">
+          <h3 className="text-base font-semibold text-gray-800 mb-1 flex items-center gap-2 shrink-0">
+            <TrendingUp className="h-5 w-5 text-indigo-500" />
+            Illustrative trend extrapolation (3Y)
+          </h3>
+          <p className="text-xs text-amber-900/90 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mb-4 leading-relaxed">
+            Not a forecast. Bars extend recent annual sales and profit using capped historical growth from the last few Screener-style annual rows; use for scenario color only, not valuation targets.
+          </p>
+          <div className="h-72 flex-1 min-h-[18rem]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={projectionRows} margin={{ top: 20, right: 10, left: -20, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F3F4F6" />
+                <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} interval={0} angle={-12} textAnchor="end" height={48} />
+                <YAxis axisLine={false} tickLine={false} tickCount={5} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
+                <Tooltip cursor={{ fill: "#F9FAFB" }} contentStyle={{ borderRadius: "12px", border: "none", boxShadow: "0 10px 15px -3px rgb(0 0 0 / 0.1)" }} />
+                <Legend wrapperStyle={{ paddingTop: "20px" }} iconType="circle" />
+                <Bar dataKey="sales" name="Model sales (illustrative)" fill={activeChartPalette.projection} radius={[6, 6, 0, 0]} maxBarSize={36} isAnimationActive={false}>
+                  <LabelList dataKey="sales" position="top" offset={6} style={{ fontSize: "10px", fill: "#94A3B8", fontWeight: 600 }} />
+                </Bar>
+                <Bar dataKey="netProfit" name="Model net profit (illustrative)" fill={activeChartPalette.profit} radius={[6, 6, 0, 0]} maxBarSize={36} isAnimationActive={false}>
+                  <LabelList dataKey="netProfit" position="top" offset={6} style={{ fontSize: "10px", fill: "#94A3B8", fontWeight: 600 }} />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </div>
       </div>
     </>

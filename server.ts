@@ -7,6 +7,7 @@ import { createServer as createViteServer } from "vite";
 import cors from "cors";
 import axios from "axios";
 import path from "path";
+import crypto from "node:crypto";
 import { format, subDays } from "date-fns";
 import * as cheerio from "cheerio";
 import sqlite3 from "sqlite3";
@@ -17,6 +18,7 @@ import { assessReportQuality, parseScreenerFinancials } from "./reportUtils";
 import { buildReportScorecard } from "./reportScoring";
 import { isCompanySnapshotData, isQualityGateResult, normalizeCompanyReportData, normalizeJudgeValidationData, normalizeRecencyValidationData } from "./shared/reportContracts";
 import { normalizeAnnouncements, normalizeCompanyFundamentals, normalizeCompanySearchResults, normalizePriceHistoryData } from "./shared/marketContracts";
+import { OUTCOMES_METHODOLOGY } from "./shared/outcomesTransparency";
 import { normalizeSavedReportDetail, normalizeSavedReportList } from "./shared/savedReportContracts";
 import { normalizeIntelligenceValidationResult } from "./shared/documentContracts";
 import { createPostgresMirror, fireMirror, PostgresMirror } from "./server/postgresMirror";
@@ -73,6 +75,28 @@ async function fetchWithRetry(url: string, options: any = {}, retries = 2) {
       throw e;
     }
   }
+}
+
+function stableAnnouncementId(input: {
+  id?: string | null;
+  symbol?: string | null;
+  companyName?: string | null;
+  subject?: string | null;
+  date?: string | null;
+  exchange?: string | null;
+  pdfLink?: string | null;
+}): string {
+  const explicitId = String(input.id || "").trim();
+  if (explicitId) return explicitId;
+  const seed = [
+    String(input.exchange || "").trim().toUpperCase(),
+    String(input.symbol || "").trim().toUpperCase(),
+    String(input.companyName || "").trim().toUpperCase(),
+    String(input.subject || "").replace(/\s+/g, " ").trim().toUpperCase(),
+    String(input.date || "").trim(),
+    String(input.pdfLink || "").trim(),
+  ].join("::");
+  return `ann_${crypto.createHash("sha1").update(seed).digest("hex").slice(0, 24)}`;
 }
 
 type DailyPriceCandle = {
@@ -142,9 +166,29 @@ type RecommendationDecision = {
   policyVersion: string;
 };
 
-function normalizeIndianAnnouncementCategory(input: string): string {
-  const v = String(input || "").toLowerCase();
-  if (v.includes("result")) return "Result";
+function isIndianResultLikeAnnouncement(categoryInput: string, subjectInput?: string): boolean {
+  const text = `${String(categoryInput || "")} ${String(subjectInput || "")}`.toLowerCase();
+  if (!text.trim()) return false;
+  return (
+    text.includes("result") ||
+    text.includes("financial result") ||
+    text.includes("quarterly") ||
+    text.includes("q1") ||
+    text.includes("q2") ||
+    text.includes("q3") ||
+    text.includes("q4") ||
+    text.includes("half year") ||
+    text.includes("nine month") ||
+    text.includes("year ended") ||
+    text.includes("audited") ||
+    text.includes("unaudited") ||
+    text.includes("earnings")
+  );
+}
+
+function normalizeIndianAnnouncementCategory(input: string, subject?: string): string {
+  const v = `${String(input || "")} ${String(subject || "")}`.toLowerCase();
+  if (isIndianResultLikeAnnouncement(input, subject)) return "Result";
   if (v.includes("board")) return "Board meeting";
   if (v.includes("compliance")) return "Compliance";
   if (v.includes("investor")) return "Investor update";
@@ -479,6 +523,18 @@ async function fetchNasdaqDailyHistory(symbol: string, fromDate: string): Promis
   throw lastErr;
 }
 
+async function fetchUsLastDailyClose(symbol: string): Promise<{ close: number; date: string } | null> {
+  try {
+    const candles = await fetchNasdaqDailyHistory(symbol, format(subDays(new Date(), 400), "yyyy-MM-dd"));
+    if (!candles.length) return null;
+    const last = candles[candles.length - 1];
+    if (!Number.isFinite(last.close)) return null;
+    return { close: last.close, date: last.date };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchUsSecProfileAndSeries(symbol: string): Promise<{
   companyName: string;
   cik: string;
@@ -597,6 +653,89 @@ function resolveIndianExchangeSymbol(url: string, hintedSymbol?: string | null):
     return slug;
   }
   return null;
+}
+
+async function resolveIndianPriceHistoryCandidates(url: string, hintedSymbol?: string | null): Promise<string[]> {
+  const candidates: string[] = [];
+  const pushCandidate = (value: string | null | undefined) => {
+    const v = String(value || "").trim().toUpperCase();
+    if (!v) return;
+    const normalized = v.endsWith(".NS") || v.endsWith(".BO") ? v.slice(0, -3) : v;
+    if (!candidates.includes(normalized)) candidates.push(normalized);
+  };
+
+  pushCandidate(hintedSymbol || null);
+  pushCandidate(resolveIndianExchangeSymbol(url, hintedSymbol));
+
+  const targetUrl = url.startsWith("http") ? url : `https://www.screener.in${url}`;
+  if (targetUrl.includes("screener.in/company/")) {
+    try {
+      const response = await axios.get(targetUrl, {
+        headers: { "User-Agent": USER_AGENTS[0] },
+        timeout: 8000,
+      });
+      const page = String(response.data || "");
+      const nseMatch = page.match(/NSE:\s*([A-Z0-9\-]+)/i);
+      const bseMatch = page.match(/BSE:\s*(\d{6})/i);
+      const bseSlugMatch = page.match(/bseindia\.com\/stock-share-price\/[^"']+\/([a-z0-9\-]+)\/\d{6}\//i);
+      if (nseMatch?.[1]) pushCandidate(nseMatch[1]);
+      if (bseMatch?.[1]) pushCandidate(bseMatch[1]);
+      if (bseSlugMatch?.[1]) pushCandidate(bseSlugMatch[1]);
+    } catch {
+      // best-effort candidate enrichment only
+    }
+  }
+
+  return candidates;
+}
+
+/** Latest completed daily bar — suitable when live quotes are unavailable (session closed or API omits last sale). */
+async function fetchIndianLastDailyClose(url: string, hintedSymbol: string | null): Promise<{ close: number; date: string } | null> {
+  const candidates = await resolveIndianPriceHistoryCandidates(url, hintedSymbol);
+  const fromDate = format(subDays(new Date(), 420), "yyyy-MM-dd");
+  for (const candidate of candidates) {
+    try {
+      const candles = await fetchIndianDailySeriesFromExchanges(candidate, fromDate);
+      if (candles.length > 0) {
+        const last = candles[candles.length - 1];
+        if (Number.isFinite(last.close)) return { close: last.close, date: last.date };
+      }
+    } catch {
+      /* try next symbol candidate */
+    }
+  }
+  return null;
+}
+
+function parseScreenerTopRatios(html: string): {
+  currentPrice: number | null;
+  marketCap: string | null;
+  pe: string | null;
+} {
+  try {
+    const $ = cheerio.load(html);
+    const ratios: Record<string, string> = {};
+    $("#top-ratios li").each((_, li) => {
+      const name = $(li).find(".name").first().text().trim().toLowerCase();
+      const value = $(li).find(".value").first().text().replace(/\s+/g, " ").trim();
+      if (name && value) ratios[name] = value;
+    });
+    const parseMoneyNumber = (raw: string | undefined): number | null => {
+      if (!raw) return null;
+      const m = raw.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+      if (!m) return null;
+      const n = Number(m[0]);
+      return Number.isFinite(n) ? n : null;
+    };
+    const price = parseMoneyNumber(ratios["current price"]);
+    return {
+      currentPrice: price,
+      marketCap: ratios["market cap"] || null,
+      pe: ratios["stock p/e"] || null,
+    };
+  } catch {
+    return { currentPrice: null, marketCap: null, pe: null };
+  }
 }
 
 async function secEdgarGet(url: string, timeout = 10000): Promise<{ data: string }> {
@@ -801,6 +940,15 @@ async function generateAIReport(
   currentPrice?: string | number | null,
   reportType: ReportType = "standard",
 ) {
+  const extractNumericPrice = (value: string | number | null | undefined): number | null => {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+    if (typeof value !== "string") return null;
+    const m = value.match(/-?\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+
   try {
     const apiKey = (process.env.GEMINI_API_KEY || "").trim();
     if (!apiKey) {
@@ -835,10 +983,29 @@ async function generateAIReport(
 7. **Management Quality & Governance**
 8. **Competitive Positioning**`;
 
+    const reportAsOf = format(new Date(), "MMMM d, yyyy");
+    const currentPriceNumeric = extractNumericPrice(currentPrice);
+    const valuationDisciplineInstruction = currentPriceNumeric != null
+      ? `Valuation discipline (MANDATORY):
+- Use Current Market Price = ${currentPriceNumeric.toFixed(2)} as the baseline for target math.
+- Show one explicit line: "Implied upside = ((Target - ${currentPriceNumeric.toFixed(2)}) / ${currentPriceNumeric.toFixed(2)}) * 100 = X%".
+- If implied upside is between -10% and +10%, recommendation must be WATCH/HOLD (not BUY).
+- BUY requires at least +15% implied upside to 12-month target.
+- AVOID/SELL requires target at least -10% below current price, or a clearly documented downside case.
+- Never give a target within +/-5% of current price and still call it a high-conviction action.
+- If evidence is mixed and upside is small, explicitly downgrade to WATCH and explain why.`
+      : `Valuation discipline (MANDATORY):
+- Current Market Price is unavailable or unreliable.
+- Do not invent precision from missing quote data.
+- If price is unavailable, avoid specific target-price math and explicitly state: "Target withheld pending reliable live quote."`;
     const prompt = `You are an expert financial analyst. Write a comprehensive, world-class equity research report for ${name} (${country === 'US' ? 'USA' : 'India'}). 
 ${styleInstruction}
     
 Ensure you analyze the LATEST available data, including recent quarterly results and any recent exchange filings.
+Never include meta-thoughts, self-corrections, internal debate, or "let's revise" language in the final report.
+Any valuation assumptions must appear exactly once in finalized form.
+
+Report publication date (authoritative — use this exact calendar date for any "Date:" / "as of" line in the report header; do not substitute training-data guesses or assumed dates): ${reportAsOf}
 
 Annual Profit & Loss Data (${country === 'US' ? 'USD Millions' : 'INR Crores'}):
 ${JSON.stringify(chartData)}
@@ -852,7 +1019,14 @@ ${JSON.stringify(announcements.map((a: any) => ({ date: a.date, subject: a.subje
 Current Market Price (authoritative):
 ${currentPrice ?? "N/A"}
 
+${valuationDisciplineInstruction}
+
 ${sectionInstruction}
+
+Output integrity rules (MANDATORY):
+- The "Recent Quarterly Results" section may only reference the 4 quarterly rows provided above.
+- Do not introduce extra quarters in that section.
+- Ensure totals and labels are internally consistent (no "last 4" section containing more than 4 rows).
 
 Use markdown formatting. Make it read like a premium institutional research report.`;
 
@@ -870,40 +1044,198 @@ Use markdown formatting. Make it read like a premium institutional research repo
 }
 
 
-async function generateQuickSnapshot(name: string, country: string, chartData: any[], quarterlyData: any[], announcements: any[]) {
-  try {
-    const apiKey = (process.env.GEMINI_API_KEY || "").trim();
-    console.log("[AI] Initializing with key length:", apiKey.length);
-    if (!apiKey) {
-      console.error("[AI] GEMINI_API_KEY is missing from environment variables.");
-      return "Snapshot unavailable (API Key not configured).";
-    }
+type QuickSnapshotMarketHints = {
+  currentPrice: number | null;
+  pe: string | null;
+  marketCap: string | null;
+};
 
-    const ai = new GoogleGenAI({ apiKey });
-    const prompt = `You are a financial analyst. Provide a 3-sentence "Quick Snapshot" of the latest results for ${name}. 
-    Focus on: 
-    1. Revenue/Profit growth (YoY or QoQ).
-    2. Key margin trends.
-    3. One major highlight from recent filings.
-    
-    Data:
-    Annual: ${JSON.stringify(chartData.slice(-2))}
-    Quarterly: ${JSON.stringify(quarterlyData.slice(-2))}
-    Filings: ${JSON.stringify(announcements.slice(0, 2).map(a => a.subject))}
-    
-    Keep it extremely concise and professional. Use bullet points.`;
+async function generateQuickSnapshot(
+  name: string,
+  country: string,
+  chartData: any[],
+  quarterlyData: any[],
+  announcements: any[],
+  marketHints?: QuickSnapshotMarketHints | null
+) {
+  const toFiniteNumber = (value: unknown): number | null => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
 
-    const result = await generateWithAnyGeminiModel(ai, prompt);
-    if ("error" in result) {
-      return `Snapshot generation failed: ${result.error}`;
-    }
-    console.log(`[AI] Snapshot generated with model: ${result.model}`);
-    return result.text || "No snapshot available.";
-  } catch (e: any) {
-    const friendlyError = formatAIError(e);
-    console.error("[AI] Snapshot failed:", friendlyError);
-    return `Snapshot generation failed: ${friendlyError}`;
-  }
+  const formatValue = (value: number | null): string => {
+    if (value == null) return "N/A";
+    const locale = country === "US" ? "en-US" : "en-IN";
+    return new Intl.NumberFormat(locale, { maximumFractionDigits: 2 }).format(value);
+  };
+
+  const formatPct = (value: number | null): string => {
+    if (value == null) return "N/A";
+    const sign = value > 0 ? "+" : "";
+    return `${sign}${value.toFixed(1)}%`;
+  };
+
+  const pctChange = (current: number | null, previous: number | null): number | null => {
+    if (current == null || previous == null || previous === 0) return null;
+    return ((current - previous) / Math.abs(previous)) * 100;
+  };
+
+  const safeMarginPct = (profit: number | null, sales: number | null): number | null => {
+    if (profit == null || sales == null || sales === 0) return null;
+    return (profit / sales) * 100;
+  };
+
+  const findPriorYearQuarterRow = (rows: any[], currentLabel: string): any | null => {
+    const label = String(currentLabel || "").trim();
+    const m = label.match(/^([A-Za-z]{3})\s+(\d{4})$/);
+    if (!m) return null;
+    const mon = m[1];
+    const y = Number(m[2]);
+    if (!Number.isFinite(y)) return null;
+    const want = `${mon} ${y - 1}`;
+    return rows.find((r) => String(r?.quarter || "").trim() === want) || null;
+  };
+
+  const latestAnnual = chartData.length ? chartData[chartData.length - 1] : null;
+  const prevAnnual = chartData.length > 1 ? chartData[chartData.length - 2] : null;
+  const latestQuarter = quarterlyData.length ? quarterlyData[quarterlyData.length - 1] : null;
+  const prevQuarter = quarterlyData.length > 1 ? quarterlyData[quarterlyData.length - 2] : null;
+  const yearAgoQuarter = latestQuarter ? findPriorYearQuarterRow(quarterlyData, latestQuarter.quarter) : null;
+
+  const annualSales = toFiniteNumber(latestAnnual?.sales);
+  const prevAnnualSales = toFiniteNumber(prevAnnual?.sales);
+  const annualProfit = toFiniteNumber(latestAnnual?.netProfit);
+  const prevAnnualProfit = toFiniteNumber(prevAnnual?.netProfit);
+  const annualEps = toFiniteNumber(latestAnnual?.eps);
+  const prevAnnualEps = toFiniteNumber(prevAnnual?.eps);
+
+  const quarterSales = toFiniteNumber(latestQuarter?.sales);
+  const prevQuarterSales = toFiniteNumber(prevQuarter?.sales);
+  const quarterProfit = toFiniteNumber(latestQuarter?.netProfit);
+  const prevQuarterProfit = toFiniteNumber(prevQuarter?.netProfit);
+  const quarterEps = toFiniteNumber(latestQuarter?.eps);
+  const prevQuarterEps = toFiniteNumber(prevQuarter?.eps);
+
+  const yoyQuarterSales = yearAgoQuarter ? toFiniteNumber(yearAgoQuarter.sales) : null;
+  const yoyQuarterProfit = yearAgoQuarter ? toFiniteNumber(yearAgoQuarter.netProfit) : null;
+  const yoyQuarterEps = yearAgoQuarter ? toFiniteNumber(yearAgoQuarter.eps) : null;
+
+  const annualSalesChange = pctChange(annualSales, prevAnnualSales);
+  const annualProfitChange = pctChange(annualProfit, prevAnnualProfit);
+  const annualEpsChange = pctChange(annualEps, prevAnnualEps);
+  const annualNetMargin = safeMarginPct(annualProfit, annualSales);
+  const prevAnnualNetMargin = safeMarginPct(prevAnnualProfit, prevAnnualSales);
+
+  const quarterSalesChange = pctChange(quarterSales, prevQuarterSales);
+  const quarterProfitChange = pctChange(quarterProfit, prevQuarterProfit);
+  const quarterEpsChange = pctChange(quarterEps, prevQuarterEps);
+  const quarterYoYSales = pctChange(quarterSales, yoyQuarterSales);
+  const quarterYoYProfit = pctChange(quarterProfit, yoyQuarterProfit);
+  const quarterYoYEps = pctChange(quarterEps, yoyQuarterEps);
+
+  const latestQuarterMargin = safeMarginPct(quarterProfit, quarterSales);
+  const prevQuarterMargin = safeMarginPct(prevQuarterProfit, prevQuarterSales);
+  const marginDelta =
+    latestQuarterMargin != null && prevQuarterMargin != null ? latestQuarterMargin - prevQuarterMargin : null;
+
+  const signalChecks = [annualSalesChange, annualProfitChange, quarterSalesChange, quarterProfitChange];
+  const improvingSignals = signalChecks.filter((v) => v != null && v > 0).length;
+  const totalSignals = signalChecks.filter((v) => v != null).length;
+
+  const latestFiling = announcements.find((a) => typeof a?.subject === "string" && a.subject.trim().length > 0);
+  const filingSubject = latestFiling?.subject?.trim() || "No recent filing headline available";
+  const filingDate = latestFiling?.date ? ` (${latestFiling.date})` : "";
+
+  const unitLabel = country === "US" ? "USD million (where stated)" : "INR crore";
+  const annLabel = latestAnnual?.year || "Latest FY";
+  const prevFYLabel = prevAnnual?.year || "Prior FY";
+  const qLabel = latestQuarter?.quarter || "Latest Q";
+  const pqLabel = prevQuarter?.quarter || "Prior Q";
+
+  const lastTwoAnnual = chartData.slice(-2);
+  const annualTable =
+    lastTwoAnnual.length === 0
+      ? ""
+      : [
+          "",
+          `### Last fiscal years (parsed from feed)`,
+          "",
+          `| Period | Sales (${unitLabel}) | Net profit | EPS | Est. net margin |`,
+          "| --- | ---: | ---: | ---: | ---: |",
+          ...lastTwoAnnual.map((r: any) => {
+            const s = toFiniteNumber(r?.sales);
+            const p = toFiniteNumber(r?.netProfit);
+            const e = toFiniteNumber(r?.eps);
+            const mg = safeMarginPct(p, s);
+            return `| ${String(r?.year || "").trim()} | ${formatValue(s)} | ${formatValue(p)} | ${formatValue(e)} | ${mg == null ? "N/A" : `${mg.toFixed(1)}%`} |`;
+          }),
+        ].join("\n");
+
+  const last4Q = quarterlyData.slice(-4);
+  const quarterlyTable =
+    last4Q.length === 0
+      ? ""
+      : [
+          "",
+          "### Last four quarters",
+          "",
+          "| Quarter | Sales | Net profit | EPS | Net margin |",
+          "| --- | ---: | ---: | ---: | ---: |",
+          ...last4Q.map((r: any) => {
+            const s = toFiniteNumber(r?.sales);
+            const p = toFiniteNumber(r?.netProfit);
+            const e = toFiniteNumber(r?.eps);
+            const mg = safeMarginPct(p, s);
+            return `| ${String(r?.quarter || "").trim()} | ${formatValue(s)} | ${formatValue(p)} | ${formatValue(e)} | ${mg == null ? "N/A" : `${mg.toFixed(1)}%`} |`;
+          }),
+        ].join("\n");
+
+  let trajectory = "Mixed signals across sales and profit momentum.";
+  if (totalSignals === 0) trajectory = "Insufficient comparable periods to score momentum.";
+  else if (improvingSignals >= 3) trajectory = "Broad improvement: most tracked growth deltas are positive.";
+  else if (improvingSignals === 0) trajectory = "Pressure: tracked sales/profit deltas are not improving sequentially.";
+  else if (improvingSignals <= 2) trajectory = "Uneven recovery: some lines improving, others flat or down.";
+
+  const valuationBlock =
+    marketHints?.currentPrice != null && Number.isFinite(marketHints.currentPrice)
+      ? [
+          "",
+          "### Valuation context (from Screener page)",
+          "",
+          `- **CMP:** ${country === "US" ? "USD" : "INR"} ${marketHints.currentPrice.toFixed(2)}`,
+          `- **Stock P/E:** ${marketHints.pe || "N/A"}`,
+          `- **Market cap:** ${marketHints.marketCap || "N/A"}`,
+          `- **Note:** Snapshot multiples come from Screener HTML; reconcile with live exchange feed before trading.`,
+        ].join("\n")
+      : "";
+
+  return [
+    `## Quick snapshot — ${name}`,
+    "",
+    `**Units:** ${unitLabel} unless noted.`,
+    "",
+    `**Period focus:** FY **${annLabel}** vs **${prevFYLabel}**; quarter **${qLabel}** vs **${pqLabel}**` +
+      (yearAgoQuarter ? `; same-quarter YoY vs **${yearAgoQuarter.quarter}**` : ""),
+    "",
+    "### Pulse",
+    "",
+    `- **Momentum score:** ${totalSignals > 0 ? `${improvingSignals}/${totalSignals} improving` : "N/A"} on sales/profit (annual YoY + quarter QoQ).`,
+    `- **FY growth:** Sales ${formatPct(annualSalesChange)} YoY · Net profit ${formatPct(annualProfitChange)} YoY · EPS ${formatPct(annualEpsChange)} YoY · Net margin ${annualNetMargin == null ? "N/A" : `${annualNetMargin.toFixed(1)}%`}` +
+      (prevAnnualNetMargin != null ? ` (${annualNetMargin != null ? (annualNetMargin - prevAnnualNetMargin >= 0 ? "+" : "") + (annualNetMargin - prevAnnualNetMargin).toFixed(1) : "N/A"} pp vs prior FY)` : ""),
+    `- **Quarter QoQ (${qLabel} vs ${pqLabel}):** Sales ${formatPct(quarterSalesChange)} · Net profit ${formatPct(quarterProfitChange)} · EPS ${formatPct(quarterEpsChange)} · Net margin ${latestQuarterMargin == null ? "N/A" : `${latestQuarterMargin.toFixed(1)}%`}` +
+      (marginDelta == null ? "" : ` (${marginDelta >= 0 ? "+" : ""}${marginDelta.toFixed(1)} pp vs prior quarter)`),
+    yearAgoQuarter
+      ? `- **Quarter YoY (${qLabel} vs ${yearAgoQuarter.quarter}):** Sales ${formatPct(quarterYoYSales)} · Net profit ${formatPct(quarterYoYProfit)} · EPS ${formatPct(quarterYoYEps)}`
+      : `- **Quarter YoY:** Prior-year matching quarter not in parsed series.`,
+    `- **Read-across:** ${trajectory}`,
+    annualTable,
+    quarterlyTable,
+    valuationBlock,
+    "",
+    "### Exchange / filings",
+    "",
+    `- **Latest filing headline:** ${filingSubject}${filingDate}`,
+  ].join("\n");
 }
 
 async function startServer() {
@@ -983,6 +1315,18 @@ async function startServer() {
       exchange TEXT,
       category TEXT
     )
+  `);
+  await db.exec(`
+    DELETE FROM announcements
+    WHERE rowid NOT IN (
+      SELECT MIN(rowid)
+      FROM announcements
+      GROUP BY symbol, companyName, subject, date, IFNULL(pdfLink, ''), exchange
+    )
+  `);
+  await db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_announcements_dedup
+    ON announcements(symbol, companyName, subject, date, IFNULL(pdfLink, ''), exchange)
   `);
 
   await db.exec(`
@@ -1631,11 +1975,14 @@ async function startServer() {
   }
 
   // Background Sync Function
+  const ENABLE_NSE_BULK_SYNC = process.env.ENABLE_NSE_BULK_SYNC === "true";
+  let nseBlockedUntilTs = 0;
+
   async function syncAnnouncements(options?: { includeAllListedCorporateAnnouncements?: boolean }) {
     try {
       const lastStored = await db.get<{ maxDate: string | null }>("SELECT MAX(date) as maxDate FROM announcements");
       const lastTs = lastStored?.maxDate ? new Date(lastStored.maxDate).getTime() : null;
-      const basePrevDate = lastTs && Number.isFinite(lastTs) ? subDays(new Date(lastTs), 1) : subDays(new Date(), 30);
+      const basePrevDate = lastTs && Number.isFinite(lastTs) ? new Date(lastTs) : subDays(new Date(), 30);
       const today = new Date();
       const prevDate = basePrevDate;
       const strToDate = format(today, "yyyyMMdd");
@@ -1656,7 +2003,7 @@ async function startServer() {
             companyName: r.companyName,
             subject: r.subject,
             date: r.date,
-            category: normalizeIndianAnnouncementCategory(r.category),
+            category: normalizeIndianAnnouncementCategory(r.category, r.subject),
           })
         )
       );
@@ -1683,8 +2030,10 @@ async function startServer() {
           totalFound += data.length;
 
           for (const item of data) {
-            const pdfLink = item.ATTACHMENTNAME ? `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${item.ATTACHMENTNAME}` : null;
-            const normalizedCategory = normalizeIndianAnnouncementCategory(item.CATEGORYNAME);
+            const pdfLink = item.ATTACHMENTNAME
+              ? `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${item.ATTACHMENTNAME}`
+              : (item.NSURL || null);
+            const normalizedCategory = normalizeIndianAnnouncementCategory(item.CATEGORYNAME, item.NEWSSUB);
             const itemDate = item.DT_TM ? new Date(item.DT_TM).getTime() : null;
             if (lastTs && itemDate && itemDate <= lastTs) {
               staleSkipped++;
@@ -1706,7 +2055,15 @@ async function startServer() {
               INSERT OR IGNORE INTO announcements (id, symbol, companyName, subject, date, pdfLink, exchange, category)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             `, [
-              item.NEWSID,
+              stableAnnouncementId({
+                id: item.NEWSID || null,
+                symbol: String(item.SCRIP_CD || ""),
+                companyName: item.SLONGNAME,
+                subject: item.NEWSSUB,
+                date: item.DT_TM,
+                exchange: "BSE",
+                pdfLink,
+              }),
               item.SCRIP_CD,
               item.SLONGNAME,
               item.NEWSSUB,
@@ -1725,7 +2082,9 @@ async function startServer() {
         }
       }
 
-      if (options?.includeAllListedCorporateAnnouncements !== false) {
+      const shouldRunNseBulkPass = options?.includeAllListedCorporateAnnouncements ?? ENABLE_NSE_BULK_SYNC;
+      const nseBlocked = Date.now() < nseBlockedUntilTs;
+      if (shouldRunNseBulkPass && !nseBlocked) {
         try {
           const universe = await fetchWithRetry("https://www.nseindia.com/api/market-data-pre-open?key=ALL", {
             headers: { Accept: "application/json", Referer: "https://www.nseindia.com/" },
@@ -1734,7 +2093,8 @@ async function startServer() {
           const symbols = (universe?.data?.data || [])
             .map((r: any) => r?.metadata?.symbol || r?.symbol)
             .filter(Boolean)
-            .slice(0, 1200);
+            .slice(0, 120);
+          let blockedHits = 0;
           for (const sym of symbols) {
             try {
               const ca = await fetchWithRetry(`https://www.nseindia.com/api/corporate-announcements?symbol=${encodeURIComponent(sym)}`, {
@@ -1742,8 +2102,9 @@ async function startServer() {
                 timeout: 12000,
               });
               const rows = ca?.data || [];
+              blockedHits = 0;
               for (const r of rows.slice(0, 12)) {
-                const category = normalizeIndianAnnouncementCategory(r?.caSubject || r?.subject || "General");
+                const category = normalizeIndianAnnouncementCategory(r?.caSubject || r?.subject || "General", r?.caSubject || r?.subject || "");
                 const date = r?.an_dt || r?.bcStartDate || r?.date || "";
                 const itemDate = date ? new Date(date).getTime() : null;
                 if (lastTs && itemDate && itemDate <= lastTs) {
@@ -1762,8 +2123,16 @@ async function startServer() {
                   continue;
                 }
                 seenFingerprints.add(fp);
-                const id = r?.attchmntFile || r?.an_id || `${sym}_${Date.parse(date || String(Date.now()))}_${Math.random().toString(36).slice(2, 7)}`;
                 const pdfLink = r?.attchmntFile ? `https://nsearchives.nseindia.com${r.attchmntFile}` : null;
+                const id = stableAnnouncementId({
+                  id: r?.an_id || r?.id || null,
+                  symbol: sym,
+                  companyName: r?.sm_name || sym,
+                  subject: r?.caSubject || r?.subject || "Corporate Announcement",
+                  date: date || new Date().toISOString(),
+                  exchange: "NSE",
+                  pdfLink,
+                });
                 const insert = await db.run(
                   `INSERT OR IGNORE INTO announcements (id, symbol, companyName, subject, date, pdfLink, exchange, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                   [
@@ -1783,8 +2152,15 @@ async function startServer() {
                   else nonResultProcessed++;
                 }
               }
+              await new Promise((resolve) => setTimeout(resolve, 350));
             } catch {
-              // best-effort for symbols that fail
+              blockedHits += 1;
+              if (blockedHits >= 3) {
+                nseBlockedUntilTs = Date.now() + (30 * 60 * 1000);
+                console.warn("[Sync] NSE bulk pass temporarily paused for 30 minutes due to repeated blocks.");
+                break;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 1200));
             }
           }
         } catch (nseErr: any) {
@@ -1799,7 +2175,9 @@ async function startServer() {
   }
 
   // Sync every 5 minutes
-  setInterval(syncAnnouncements, 5 * 60 * 1000);
+  setInterval(() => {
+    void syncAnnouncements({ includeAllListedCorporateAnnouncements: false });
+  }, 5 * 60 * 1000);
 
   // Recompute rules-first policy weights every day
   setInterval(() => {
@@ -1969,12 +2347,12 @@ async function startServer() {
       }
 
       // Trigger a sync in the background to ensure fresh data for next time
-      syncAnnouncements();
+      syncAnnouncements({ includeAllListedCorporateAnnouncements: false });
 
       const rows = await db.all("SELECT * FROM announcements ORDER BY date DESC LIMIT 4000");
       const normalized = rows.map((r: any) => ({
         ...r,
-        category: normalizeIndianAnnouncementCategory(r.category),
+        category: normalizeIndianAnnouncementCategory(r.category, r.subject),
       }));
 
       if (type === "results") {
@@ -1985,12 +2363,72 @@ async function startServer() {
         for (const row of normalized) {
           const key = `${row.symbol || ""}::${row.companyName || ""}`;
           if (!latestOverallByCompany.has(key)) latestOverallByCompany.set(key, row);
-          if (row.category === "Result" && !latestResultByCompany.has(key)) latestResultByCompany.set(key, row);
+          if (isIndianResultLikeAnnouncement(row.category, row.subject) && !latestResultByCompany.has(key)) latestResultByCompany.set(key, row);
         }
         const filtered = Array.from(latestResultByCompany.entries())
-          .filter(([key]) => latestOverallByCompany.get(key)?.category === "Result")
+          .filter(([key]) => isIndianResultLikeAnnouncement(latestOverallByCompany.get(key)?.category, latestOverallByCompany.get(key)?.subject))
           .map(([, row]) => row)
           .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        if (filtered.length === 0) {
+          const fallbackFromDb = normalized
+            .filter((row) => isIndianResultLikeAnnouncement(row.category, row.subject))
+            .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+            .slice(0, 120);
+          if (fallbackFromDb.length > 0) {
+            return res.json({ success: true, data: normalizeAnnouncements(fallbackFromDb) });
+          }
+
+          const strToDate = format(new Date(), "yyyyMMdd");
+          const strPrevDate = format(subDays(new Date(), 30), "yyyyMMdd");
+          const liveRows: any[] = [];
+          const liveCategories = ["Result", "Financial Result"];
+          try {
+            for (const cat of liveCategories) {
+              for (let page = 1; page <= 3; page++) {
+                const bseUrl = `https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w?pageno=${page}&strCat=${encodeURIComponent(cat)}&strPrevDate=${strPrevDate}&strScrip=&strSearch=P&strToDate=${strToDate}&strType=C`;
+                const response = await axios.get(bseUrl, {
+                  headers: {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    Accept: "application/json",
+                    Referer: "https://www.bseindia.com/",
+                    Origin: "https://www.bseindia.com",
+                  },
+                  timeout: 20000,
+                });
+                const table = response.data?.Table || [];
+                if (!table.length) break;
+                liveRows.push(...table.map((item: any) => ({
+                  id: String(item.NEWSID || `${item.SCRIP_CD}_${item.DT_TM}`),
+                  symbol: String(item.SCRIP_CD || ""),
+                  companyName: String(item.SLONGNAME || item.SCRIP_CD || "Unknown Company"),
+                  subject: String(item.NEWSSUB || item.HEADLINE || "Corporate Announcement"),
+                  date: item.DT_TM || new Date().toISOString(),
+                  pdfLink: item.ATTACHMENTNAME ? `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${item.ATTACHMENTNAME}` : null,
+                  exchange: "BSE",
+                  category: normalizeIndianAnnouncementCategory(item.CATEGORYNAME || "Result", item.NEWSSUB || item.HEADLINE || ""),
+                })));
+              }
+            }
+          } catch (liveErr: any) {
+            console.warn("[Announcements] Live BSE fallback failed:", liveErr?.message || String(liveErr));
+          }
+          const dedup = new Map<string, any>();
+          for (const row of liveRows) {
+            const key = announcementProcessingFingerprint({
+              symbol: row.symbol,
+              companyName: row.companyName,
+              subject: row.subject,
+              date: row.date,
+              category: row.category,
+            });
+            if (!dedup.has(key)) dedup.set(key, row);
+          }
+          const liveResult = Array.from(dedup.values())
+            .filter((row) => isIndianResultLikeAnnouncement(row.category, row.subject))
+            .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+            .slice(0, 120);
+          return res.json({ success: true, data: normalizeAnnouncements(liveResult) });
+        }
         return res.json({ success: true, data: normalizeAnnouncements(filtered) });
       }
 
@@ -2437,7 +2875,15 @@ async function startServer() {
         const chartData = sec.annual;
         const quarterlyData = sec.quarterly;
         const recentAnnouncements = await fetchSecFilingsForTicker(symbol, 10, "sec_report_");
-        const currentPriceNum = parseNasdaqMoneyToNumber(quote?.primaryData?.lastSalePrice || quote?.secondaryData?.lastSalePrice);
+        let currentPriceNum = parseNasdaqMoneyToNumber(quote?.primaryData?.lastSalePrice || quote?.secondaryData?.lastSalePrice);
+        let priceDetailSource = "SEC EDGAR + Nasdaq public APIs";
+        if (currentPriceNum == null) {
+          const dailyClose = await fetchUsLastDailyClose(symbol);
+          if (dailyClose != null) {
+            currentPriceNum = dailyClose.close;
+            priceDetailSource = `SEC EDGAR + Nasdaq APIs — USD ${dailyClose.close.toFixed(2)} last daily close (${dailyClose.date})`;
+          }
+        }
         const aiReport = includeAI
           ? await generateAIReport(
               sec.companyName || symbol,
@@ -2460,7 +2906,7 @@ async function startServer() {
             price: currentPriceNum != null ? currentPriceNum.toFixed(2) : "N/A",
             marketCap: quote?.keyStats?.marketCap?.value || "N/A",
             pe: quote?.keyStats?.peRatio?.value || "N/A",
-            source: "SEC EDGAR + Nasdaq public APIs",
+            source: priceDetailSource,
           },
         };
         const payload = normalizeCompanyReportData(payloadRaw);
@@ -2472,15 +2918,13 @@ async function startServer() {
         if (!isQualityGateResult(qualityGate)) {
           return res.status(500).json({ success: false, error: "quality_gate_contract_invalid" });
         }
-        if (qualityGate.passed) {
-          await saveGeneratedReport({
-            companyName: sec.companyName || symbol,
-            symbol,
-            country: "US",
-            sourceUrl: url,
-            report: payload,
-          });
-        }
+        await saveGeneratedReport({
+          companyName: sec.companyName || symbol,
+          symbol,
+          country: "US",
+          sourceUrl: url,
+          report: payload,
+        });
         return res.json({ success: true, data: payload, qualityGate });
       }
 
@@ -2533,19 +2977,31 @@ async function startServer() {
       try {
         if (bseSymbol) {
           recentAnnouncements = await db.all(
-            "SELECT * FROM announcements WHERE symbol = ? AND category = 'Result' ORDER BY date DESC LIMIT 3", 
+            "SELECT * FROM announcements WHERE symbol = ? AND (category = 'Result' OR lower(subject) LIKE '%result%' OR lower(subject) LIKE '%quarter%' OR lower(subject) LIKE '%financial%') ORDER BY date DESC LIMIT 3",
             [bseSymbol]
           );
         } else {
           const shortName = name.split(' ')[0];
           recentAnnouncements = await db.all(
-            "SELECT * FROM announcements WHERE companyName LIKE ? AND category = 'Result' ORDER BY date DESC LIMIT 3", 
+            "SELECT * FROM announcements WHERE companyName LIKE ? AND (category = 'Result' OR lower(subject) LIKE '%result%' OR lower(subject) LIKE '%quarter%' OR lower(subject) LIKE '%financial%') ORDER BY date DESC LIMIT 3",
             [`%${shortName}%`]
           );
         }
       } catch (dbErr) {
         console.error("Error fetching recent announcements for report:", dbErr);
       }
+
+      const topRatios = parseScreenerTopRatios(response.data);
+      const lastDaily = await fetchIndianLastDailyClose(targetUrl, bseSymbol);
+      const effectivePrice = topRatios.currentPrice ?? lastDaily?.close ?? null;
+      const priceForAi =
+        effectivePrice != null
+          ? `${effectivePrice.toFixed(2)} INR${
+              topRatios.currentPrice != null
+                ? " (Screener Current Price)"
+                : ` (last completed daily session close as of ${lastDaily?.date}; used when live quote unavailable)`
+            }`
+          : "N/A";
 
       const aiReport = includeAI
         ? await generateAIReport(
@@ -2554,7 +3010,7 @@ async function startServer() {
             chartData,
             quarterlyData,
             recentAnnouncements,
-            "N/A",
+            priceForAi,
             normalizedReportType,
           )
         : "AI generation skipped for validation request.";
@@ -2567,6 +3023,19 @@ async function startServer() {
         aiReport,
         reportType: normalizedReportType,
         parsingWarnings: parsed.parsingWarnings,
+        summary: effectivePrice != null || topRatios.marketCap || topRatios.pe || lastDaily
+          ? {
+              price: effectivePrice != null ? effectivePrice.toFixed(2) : "N/A",
+              marketCap: topRatios.marketCap || "N/A",
+              pe: topRatios.pe || "N/A",
+              source:
+                topRatios.currentPrice != null
+                  ? "INR — Screener top ratios (Current Price / Market Cap / Stock P/E)"
+                  : lastDaily
+                    ? `INR — previous session close (${lastDaily.date}, daily series); top-ratio fallback unavailable`
+                    : "INR — source unavailable",
+            }
+          : undefined,
       };
       const payload = normalizeCompanyReportData(payloadRaw);
       if (!payload) {
@@ -2580,15 +3049,13 @@ async function startServer() {
       if (parsed.parsingWarnings.length) {
         qualityGate.missingComponents.push(...parsed.parsingWarnings);
       }
-      if (qualityGate.passed) {
-        await saveGeneratedReport({
-          companyName: name,
-          symbol: bseSymbol || null,
-          country: "IN",
-          sourceUrl: targetUrl,
-          report: payload,
-        });
-      }
+      await saveGeneratedReport({
+        companyName: name,
+        symbol: bseSymbol || null,
+        country: "IN",
+        sourceUrl: targetUrl,
+        report: payload,
+      });
       res.json({ success: true, data: payload, qualityGate });
     } catch (error: any) {
       console.error("[Report] Error:", error.response?.status, error.message);
@@ -2606,6 +3073,7 @@ async function startServer() {
       }
 
       let resolvedSymbol: string | null = null;
+      let indianCandidates: string[] = [];
       if (country === "US") {
         const hinted = typeof symbol === "string" ? symbol.trim().toUpperCase() : "";
         if (hinted) resolvedSymbol = hinted;
@@ -2613,7 +3081,8 @@ async function startServer() {
           resolvedSymbol = parseUsSymbol(url);
         }
       } else {
-        resolvedSymbol = resolveIndianExchangeSymbol(url, typeof symbol === "string" ? symbol : null);
+        indianCandidates = await resolveIndianPriceHistoryCandidates(url, typeof symbol === "string" ? symbol : null);
+        resolvedSymbol = indianCandidates[0] || null;
       }
 
       if (!resolvedSymbol) {
@@ -2622,7 +3091,21 @@ async function startServer() {
 
       const candles = country === "US"
         ? await fetchNasdaqDailyHistory(resolvedSymbol, format(subDays(new Date(), 365 * 5), "yyyy-MM-dd"))
-        : await fetchIndianDailySeriesFromExchanges(resolvedSymbol, format(subDays(new Date(), 365 * 5), "yyyy-MM-dd"));
+        : await (async () => {
+            let lastErr: any = null;
+            for (const candidate of indianCandidates) {
+              try {
+                const rows = await fetchIndianDailySeriesFromExchanges(candidate, format(subDays(new Date(), 365 * 5), "yyyy-MM-dd"));
+                if (rows.length > 0) {
+                  resolvedSymbol = candidate;
+                  return rows;
+                }
+              } catch (err: any) {
+                lastErr = err;
+              }
+            }
+            throw lastErr || new Error("No candle data found from NSE/BSE");
+          })();
       const payload = normalizePriceHistoryData({
         symbol: resolvedSymbol,
         candles,
@@ -2653,6 +3136,7 @@ async function startServer() {
       let chartData: ReportChartRow[] = [];
       let quarterlyData: ReportQuarterlyRow[] = [];
       let recentAnnouncements: ReportAnnouncement[] = [];
+      let snapshotHints: QuickSnapshotMarketHints | null = null;
 
       if (country === 'US') {
         const symbol = parseUsSymbol(url);
@@ -2680,17 +3164,31 @@ async function startServer() {
         chartData = parsed.chartData;
         quarterlyData = parsed.quarterlyData;
 
+        const topRatios = parseScreenerTopRatios(String(response.data || ""));
+        snapshotHints = {
+          currentPrice: topRatios.currentPrice,
+          pe: topRatios.pe,
+          marketCap: topRatios.marketCap,
+        };
+
         // BSE Announcements
         const bseMatch = response.data.match(/BSE:\s*(\d{6})/);
         if (bseMatch && bseMatch[1]) {
           recentAnnouncements = await db.all(
-            "SELECT subject FROM announcements WHERE symbol = ? AND category = 'Result' ORDER BY date DESC LIMIT 3", 
+            "SELECT subject FROM announcements WHERE symbol = ? AND (category = 'Result' OR lower(subject) LIKE '%result%' OR lower(subject) LIKE '%quarter%' OR lower(subject) LIKE '%financial%') ORDER BY date DESC LIMIT 3",
             [bseMatch[1]]
           );
         }
       }
 
-      const snapshot = await generateQuickSnapshot(name, country as string, chartData, quarterlyData, recentAnnouncements);
+      const snapshot = await generateQuickSnapshot(
+        name,
+        country as string,
+        chartData,
+        quarterlyData,
+        recentAnnouncements,
+        snapshotHints
+      );
       const snapshotPayload = { name, snapshot };
       if (!isCompanySnapshotData(snapshotPayload)) {
         return res.status(500).json({ success: false, error: "snapshot_contract_invalid" });
@@ -2800,7 +3298,7 @@ async function startServer() {
 
   app.get("/api/reports/saved", async (req, res) => {
     try {
-      const { country, symbol, limit = "50" } = req.query as Record<string, string>;
+      const { country, symbol, sourceUrl, limit = "50" } = req.query as Record<string, string>;
       const where: string[] = [];
       const params: any[] = [];
       if (country) {
@@ -2810,6 +3308,10 @@ async function startServer() {
       if (symbol) {
         where.push("symbol = ?");
         params.push(symbol);
+      }
+      if (sourceUrl) {
+        where.push("sourceUrl = ?");
+        params.push(sourceUrl);
       }
       const lim = Math.min(200, Math.max(1, Number(limit) || 50));
       const query = `
@@ -3099,10 +3601,45 @@ async function startServer() {
           hitRatePct,
           avgReturnPct,
           asOf: new Date().toISOString(),
+          methodology: OUTCOMES_METHODOLOGY,
         },
       });
     } catch (error: any) {
       return res.status(500).json({ success: false, error: error.message || "outcomes_failed" });
+    }
+  });
+
+  app.get("/api/reports/outcomes/latest", async (req, res) => {
+    try {
+      const symbol = String(req.query.symbol || "").trim().toUpperCase();
+      const countryRaw = String(req.query.country || "IN").trim().toUpperCase();
+      const country = countryRaw === "US" ? "US" : "IN";
+      const horizonDays = Number(req.query.horizonDays || 90);
+      if (!symbol) return res.status(400).json({ success: false, error: "symbol_required" });
+      if (!Number.isFinite(horizonDays) || horizonDays <= 0) {
+        return res.status(400).json({ success: false, error: "horizonDays must be a positive number" });
+      }
+      const row = await db.get<{
+        reportId: number;
+        horizonDays: number;
+        reportDate: string;
+        entryDate: string | null;
+        entryPrice: number | null;
+        targetDate: string | null;
+        targetPrice: number | null;
+        returnPct: number | null;
+        status: string;
+      }>(
+        `SELECT reportId, horizonDays, reportDate, entryDate, entryPrice, targetDate, targetPrice, returnPct, status
+         FROM report_outcomes
+         WHERE symbol = ? AND country = ? AND horizonDays = ?
+         ORDER BY datetime(updatedAt) DESC
+         LIMIT 1`,
+        [symbol, country, horizonDays]
+      );
+      return res.json({ success: true, data: row || null });
+    } catch (error: any) {
+      return res.status(500).json({ success: false, error: error.message || "outcomes_latest_failed" });
     }
   });
 
@@ -3526,15 +4063,6 @@ async function startServer() {
     }
   });
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    // Start initial sync after server is listening
-    syncAnnouncements();
-    // Fetch SEC ticker mapping
-    fetchTickerMapping();
-  });
-
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     console.log("Initializing Vite middleware...");
     const vite = await createViteServer({
@@ -3566,6 +4094,12 @@ async function startServer() {
       reqId,
       message: process.env.NODE_ENV === 'development' ? err.message : undefined
     });
+  });
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    syncAnnouncements({ includeAllListedCorporateAnnouncements: false });
+    fetchTickerMapping();
   });
 }
 

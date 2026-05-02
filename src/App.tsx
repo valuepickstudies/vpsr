@@ -23,7 +23,8 @@ import {
   Anchor,
   Shield,
   Radar,
-  Activity
+  Activity,
+  Brain
 } from 'lucide-react';
 import { format, subDays } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, LabelList } from 'recharts';
@@ -31,12 +32,14 @@ import html2canvas from 'html2canvas';
 import { marked } from 'marked';
 import { auth, googleProvider, db } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, onSnapshot, collection, addDoc, deleteDoc } from 'firebase/firestore';
+import { doc, getDoc, onSnapshot, collection, addDoc, deleteDoc } from 'firebase/firestore';
 import { STRATEGY_PORTFOLIOS, type StrategyId } from '../strategyPortfolios';
+import { buildReportScorecard } from '../reportScoring';
+import { buildFutureProjectionRows } from '../reportUtils';
 import type { CompanyReportData, CompanySnapshotData, QualityGateResult, ReportType } from '../shared/reportTypes';
 import type { SavedReportListItem } from '../shared/savedReportContracts';
 import { fetchJSON } from './services/apiClient';
-import { createRecommendation, fetchCompanyReport, fetchCompanySnapshot, fetchLatestRecommendationPolicy, fetchOutcomesSummary, fetchRecommendationById, fetchRecommendationCalibration, fetchReportQuality, fetchReportScoreById, fetchSavedReports, fetchThesisMemory, type OutcomesSummaryData, type RecommendationPolicyData, type ReportScoreData, type ThesisMemoryData } from './services/reportService';
+import { createRecommendation, fetchCompanyReport, fetchCompanySnapshot, fetchLatestRecommendationPolicy, fetchLatestTrackedOutcome, fetchOutcomesSummary, fetchRecommendationById, fetchRecommendationCalibration, fetchReportQuality, fetchReportScoreById, fetchSavedReports, fetchThesisMemory, type LatestTrackedOutcome, type OutcomesSummaryData, type RecommendationPolicyData, type ReportScoreData, type ThesisMemoryData } from './services/reportService';
 import { fetchHoldingMetrics, fetchPositionSizing, fetchStrategyPerformance, type PositionSizingData } from './services/portfolioService';
 import { getErrorMessage } from './utils/errorUtils';
 import ScannerWorkspace, { type ScannerStrategy } from './components/ScannerWorkspace';
@@ -46,6 +49,7 @@ import ReportInsightsPanel from './components/ReportInsightsPanel';
 import ReportChartsSection from './components/ReportChartsSection';
 import FundamentalsPanel from './components/FundamentalsPanel';
 import SnapshotModal from './components/SnapshotModal';
+import DecisionEngineScreen from './components/DecisionEngineScreen';
 import {
   fetchAnnouncementsByType,
   fetchCompanyFundamentals,
@@ -79,11 +83,14 @@ type SavedCompany = {
   symbol: string;
 };
 
+type ActiveTab = 'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio' | 'decisionEngine';
+type DashboardOrigin = 'discover' | 'results' | 'companies' | 'saved' | 'scanners' | 'portfolio' | 'all' | 'decisionEngine';
+
 const SELECTED_COMPANY_STORAGE_KEY = 'selectedCompanyContext';
 function loadSelectedCompanyContext(): {
   company: SavedCompany | null;
   country: 'IN' | 'US';
-  activeTab: 'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio';
+  activeTab: ActiveTab;
 } {
   try {
     const raw = localStorage.getItem(SELECTED_COMPANY_STORAGE_KEY);
@@ -98,9 +105,11 @@ function loadSelectedCompanyContext(): {
   }
 }
 
-function redactCompanyNameFromText(input: string, companyName: string, symbol?: string, replacement = '[Hidden Company]'): string {
+/** Replace each character of the match with X (same length). */
+function redactCompanyNameFromText(input: string, companyName: string, symbol?: string): string {
   if (!input) return input;
   const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mask = (match: string) => 'X'.repeat(match.length);
   const legalSuffixes = new Set(['ltd', 'limited', 'inc', 'corp', 'corporation', 'co', 'company', 'plc', 'llc', 'pvt', 'private']);
   const words = companyName.trim().match(/[A-Za-z0-9]+/g) || [];
   const coreWords = [...words];
@@ -108,13 +117,25 @@ function redactCompanyNameFromText(input: string, companyName: string, symbol?: 
     coreWords.pop();
   }
   const patterns: RegExp[] = [];
+
+  if (symbol && symbol.length >= 2 && symbol.length <= 10) {
+    const es = escapeRegex(symbol);
+    const ex = '(?:NSE|NYSE|NASDAQ|BSE|OTC)';
+    patterns.push(new RegExp(`\\(\\s*${es}\\s*\\)`, 'gi'));
+    patterns.push(new RegExp(`\\[\\s*${es}\\s*\\]`, 'gi'));
+    patterns.push(new RegExp(`\\{\\s*${es}\\s*\\}`, 'gi'));
+    patterns.push(new RegExp(`\\(\\s*${ex}\\s*:\\s*${es}\\s*\\)`, 'gi'));
+    patterns.push(new RegExp(`\\[\\s*${ex}\\s*:\\s*${es}\\s*\\]`, 'gi'));
+    patterns.push(new RegExp(`\\b${es}\\b`, 'gi'));
+  }
+
   if (companyName.trim()) patterns.push(new RegExp(escapeRegex(companyName.trim()), 'gi'));
   if (words.length) patterns.push(new RegExp(`\\b${words.map(escapeRegex).join('\\s+')}\\b`, 'gi'));
   if (coreWords.length && coreWords.length !== words.length) patterns.push(new RegExp(`\\b${coreWords.map(escapeRegex).join('\\s+')}\\b`, 'gi'));
   if (coreWords.length >= 2) patterns.push(new RegExp(`\\b${escapeRegex(coreWords[0])}\\s+${escapeRegex(coreWords[1])}\\b`, 'gi'));
-  if (symbol && symbol.length >= 2 && symbol.length <= 10) patterns.push(new RegExp(`\\b${escapeRegex(symbol)}\\b`, 'gi'));
+
   let output = input;
-  for (const p of patterns) output = output.replace(p, replacement);
+  for (const p of patterns) output = output.replace(p, mask);
   return output;
 }
 
@@ -189,10 +210,6 @@ type PriceActionMarker = {
   kind: 'breakout' | 'breakdown' | 'swing-high' | 'swing-low';
 };
 
-function clampNumber(v: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, v));
-}
-
 function filterCandlesByRange(candles: TechnicalCandle[], range: TechnicalRange): TechnicalCandle[] {
   if (!candles.length) return [];
   const days =
@@ -230,33 +247,6 @@ function buildPriceActionMarkers(candles: TechnicalCandle[]): PriceActionMarker[
 
   out.sort((a, b) => a.ts - b.ts);
   return out.slice(-20);
-}
-
-function buildFutureProjectionRows(chartData: Array<{ year: string; sales: number; netProfit: number }>) {
-  const rows = (chartData || []).slice(-4).map((r) => ({
-    year: String(r.year),
-    sales: Number(r.sales) || 0,
-    netProfit: Number(r.netProfit) || 0,
-  })).filter((r) => Number.isFinite(r.sales) && Number.isFinite(r.netProfit));
-  if (rows.length < 2) return [];
-  const salesGrowth = rows.slice(1).map((r, i) => rows[i].sales > 0 ? (r.sales / rows[i].sales - 1) : 0);
-  const profitGrowth = rows.slice(1).map((r, i) => rows[i].netProfit > 0 ? (r.netProfit / rows[i].netProfit - 1) : 0);
-  const avgSalesGrowth = salesGrowth.length ? salesGrowth.reduce((a, b) => a + b, 0) / salesGrowth.length : 0;
-  const avgProfitGrowth = profitGrowth.length ? profitGrowth.reduce((a, b) => a + b, 0) / profitGrowth.length : 0;
-  const last = rows[rows.length - 1];
-  let s = last.sales;
-  let p = last.netProfit;
-  const out = [];
-  for (let i = 1; i <= 3; i++) {
-    s = s * (1 + clampNumber(avgSalesGrowth, -0.2, 0.35));
-    p = p * (1 + clampNumber(avgProfitGrowth, -0.3, 0.4));
-    out.push({
-      year: `${Number(last.year || new Date().getFullYear()) + i}E`,
-      sales: Number(s.toFixed(2)),
-      netProfit: Number(p.toFixed(2)),
-    });
-  }
-  return out;
 }
 
 enum OperationType {
@@ -311,17 +301,19 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'all' | 'results' | 'companies' | 'saved' | 'scanners' | 'discover' | 'admin' | 'portfolio'>(() => loadSelectedCompanyContext().activeTab);
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => loadSelectedCompanyContext().activeTab);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
   const [searchQuery, setSearchQuery] = useState('');
+  const [announcementSearchQuery, setAnnouncementSearchQuery] = useState('');
   const [companies, setCompanies] = useState<CompanySearchResult[]>([]);
   const [searchingCompanies, setSearchingCompanies] = useState(false);
 
   // Dashboard State
   const [selectedCompany, setSelectedCompany] = useState<SavedCompany | null>(() => loadSelectedCompanyContext().company);
+  const [dashboardOrigin, setDashboardOrigin] = useState<DashboardOrigin>('discover');
   const [companyData, setCompanyData] = useState<CompanyFundamentals | null>(null);
   const [loadingCompany, setLoadingCompany] = useState(false);
 
@@ -353,18 +345,8 @@ export default function App() {
   const [scannerResults, setScannerResults] = useState<CompanySearchResult[]>([]);
   const [loadingScanner, setLoadingScanner] = useState(false);
   const [scannerWorkspaceTab, setScannerWorkspaceTab] = useState<'scanners' | 'results' | 'reports'>('scanners');
-  const [isPaidCustomer, setIsPaidCustomer] = useState(false);
+  const [isPaidCustomer, setIsPaidCustomer] = useState(true);
   const [country, setCountry] = useState<'IN' | 'US'>(() => loadSelectedCompanyContext().country);
-
-  // Feature Flags
-  const [visiblePages, setVisiblePages] = useState({
-    discover: true,
-    all: true,
-    companies: true,
-    saved: true,
-    scanners: true,
-    portfolio: false,
-  });
 
   const [portfolioItems, setPortfolioItems] = useState<PortfolioItem[]>([]);
   const [portfolioForm, setPortfolioForm] = useState<Omit<PortfolioItem, 'id'>>({
@@ -389,11 +371,15 @@ export default function App() {
   const [savedReports, setSavedReports] = useState<SavedReportListItem[]>([]);
   const [loadingSavedReports, setLoadingSavedReports] = useState(false);
   const [judgeData, setJudgeData] = useState<QualityGateResult | null>(null);
+  const judgeDataRef = useRef<QualityGateResult | null>(null);
+  judgeDataRef.current = judgeData;
   const [loadingJudge, setLoadingJudge] = useState(false);
   const [recencyValidation, setRecencyValidation] = useState<{ latestAnnouncementDate: string | null; checkedAt: string; symbol: string } | null>(null);
   const [reportScore, setReportScore] = useState<ReportScoreData["scorecard"] | null>(null);
   const [outcomesSummary, setOutcomesSummary] = useState<OutcomesSummaryData | null>(null);
+  const [latestTrackedOutcome, setLatestTrackedOutcome] = useState<LatestTrackedOutcome | null>(null);
   const [loadingScoreAndOutcomes, setLoadingScoreAndOutcomes] = useState(false);
+  const [reportGeneratedAt, setReportGeneratedAt] = useState<string | null>(null);
   const [thesisMemory, setThesisMemory] = useState<ThesisMemoryData | null>(null);
   const [positionSizing, setPositionSizing] = useState<PositionSizingData | null>(null);
   const [recommendation, setRecommendation] = useState<{
@@ -402,6 +388,7 @@ export default function App() {
     horizonDays: number;
     riskClass: "low" | "medium" | "high";
     explainability: { positive: string[]; negative: string[]; caveats: string[] };
+    scoreSnapshotTotal?: number;
   } | null>(null);
   const [recommendationCalibration, setRecommendationCalibration] = useState<{
     sampleCount: number;
@@ -442,18 +429,6 @@ export default function App() {
   const hasAdminAccess = isAdmin || isLocalAdminAuthenticated;
 
   useEffect(() => {
-    // Listen for feature flags
-    const unsubFlags = onSnapshot(collection(db, 'featureFlags'), (snapshot) => {
-      const updates: Partial<typeof visiblePages> = {};
-      snapshot.forEach((doc) => {
-        const key = doc.id as keyof typeof visiblePages;
-        updates[key] = Boolean(doc.data().enabled);
-      });
-      setVisiblePages(prev => ({ ...prev, ...updates }));
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'featureFlags');
-    });
-
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       if (currentUser) {
@@ -486,19 +461,9 @@ export default function App() {
 
     return () => {
       unsubscribe();
-      unsubFlags();
       unsubPortfolio();
     };
   }, []);
-
-  const togglePageVisibility = async (page: string, isVisible: boolean) => {
-    if (!hasAdminAccess) return;
-    try {
-      await setDoc(doc(db, 'featureFlags', page), { enabled: !isVisible });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `featureFlags/${page}`);
-    }
-  };
 
   const addPortfolioItem = async () => {
     if (!hasAdminAccess) return;
@@ -677,8 +642,15 @@ export default function App() {
     if (!selectedCompany) return;
     setLoadingSavedReports(true);
     try {
-      const json = await fetchSavedReports(country, selectedCompany.symbol || selectedCompany.id);
-      if (json.success) setSavedReports(json.data || []);
+      const symbol = selectedCompany.symbol || selectedCompany.id;
+      const bySymbol = await fetchSavedReports(country, symbol);
+      if (bySymbol.success && bySymbol.data.length > 0) {
+        setSavedReports(bySymbol.data || []);
+      } else {
+        const byUrl = await fetchSavedReports(country, undefined, selectedCompany.url);
+        if (byUrl.success) setSavedReports(byUrl.data || []);
+        else setSavedReports([]);
+      }
     } catch (err: unknown) {
       console.warn('Failed to load saved reports', err);
     } finally {
@@ -691,8 +663,46 @@ export default function App() {
     setLoadingScoreAndOutcomes(true);
     try {
       let recommendationConfidencePct: number | null = null;
-      const saved = await fetchSavedReports(country, selectedCompany.symbol || selectedCompany.id);
-      const latestReport = saved.success && saved.data.length > 0 ? saved.data[0] : null;
+      const symbol = selectedCompany.symbol || selectedCompany.id;
+      const savedBySymbol = await fetchSavedReports(country, symbol);
+      const savedByUrl = (!savedBySymbol.success || savedBySymbol.data.length === 0)
+        ? await fetchSavedReports(country, undefined, selectedCompany.url)
+        : null;
+      const latestReport = savedBySymbol.success && savedBySymbol.data.length > 0
+        ? savedBySymbol.data[0]
+        : (savedByUrl?.success && savedByUrl.data.length > 0 ? savedByUrl.data[0] : null);
+      const applySessionPreview = async (
+        card: ReportScoreData["scorecard"],
+        caveats: string[],
+        withSizing: boolean
+      ) => {
+        setReportScore(card);
+        const conf = Math.max(5, Math.min(95, Math.round(card.totalScore * 0.85)));
+        recommendationConfidencePct = conf;
+        setRecommendation({
+          action: card.totalScore >= 72 ? "buy" : card.totalScore >= 52 ? "watch" : "avoid",
+          confidencePct: conf,
+          horizonDays: 90,
+          riskClass: card.breakdown.risk >= 70 ? "low" : card.breakdown.risk >= 45 ? "medium" : "high",
+          explainability: {
+            positive: [`quality:${card.breakdown.quality}`, `valuation:${card.breakdown.valuation}`],
+            negative: [`risk:${100 - card.breakdown.risk}`],
+            caveats,
+          },
+          scoreSnapshotTotal: card.totalScore,
+        });
+        if (withSizing) {
+          const sizing = await fetchPositionSizing({
+            capital: strategyInvestmentAmount || 100000,
+            riskBudgetPct: 1,
+            stopLossPct: 8,
+            candidates: [{ symbol: selectedCompany.symbol || selectedCompany.id, score: card.totalScore }],
+          });
+          if (sizing.success) setPositionSizing(sizing.data);
+          else setPositionSizing(null);
+        }
+      };
+
       if (latestReport) {
         const score = await fetchReportScoreById(Number(latestReport.id));
         if (score.success) {
@@ -726,12 +736,21 @@ export default function App() {
                 horizonDays: recData.data.horizonDays,
                 riskClass: recData.data.riskClass,
                 explainability: recData.data.explainability,
+                scoreSnapshotTotal: recData.data.scoreSnapshot.totalScore,
               });
             } else {
-              setRecommendation(null);
+              await applySessionPreview(
+                score.data.scorecard,
+                ["Could not load recommendation row — showing score-derived preview"],
+                false
+              );
             }
           } else {
-            setRecommendation(null);
+            await applySessionPreview(
+              score.data.scorecard,
+              ["No recommendation id from server — showing score-derived preview"],
+              false
+            );
           }
           const sizing = await fetchPositionSizing({
             capital: strategyInvestmentAmount || 100000,
@@ -741,7 +760,25 @@ export default function App() {
           });
           if (sizing.success) setPositionSizing(sizing.data);
           else setPositionSizing(null);
+        } else if (reportData) {
+          const localCard = buildReportScorecard(reportData, judgeDataRef.current);
+          await applySessionPreview(
+            localCard,
+            ["Saved score API failed — using session scorecard"],
+            true
+          );
+        } else {
+          setReportScore(null);
+          setPositionSizing(null);
+          setRecommendation(null);
         }
+      } else if (reportData) {
+        const localCard = buildReportScorecard(reportData, judgeDataRef.current);
+        await applySessionPreview(
+          localCard,
+          ["Session preview — save the report to persist score & recommendation"],
+          true
+        );
       } else {
         setReportScore(null);
         setPositionSizing(null);
@@ -750,6 +787,9 @@ export default function App() {
       const outcomes = await fetchOutcomesSummary(90, country);
       if (outcomes.success) setOutcomesSummary(outcomes.data);
       else setOutcomesSummary(null);
+      setLatestTrackedOutcome(null);
+      const lastOutcome = await fetchLatestTrackedOutcome((selectedCompany.symbol || selectedCompany.id).toUpperCase(), country, 90);
+      if (lastOutcome.success) setLatestTrackedOutcome(lastOutcome.data);
       const calibration = await fetchRecommendationCalibration(180);
       if (calibration.success && recommendationConfidencePct != null) {
         const band = calibration.data.buckets.find((b) => recommendationConfidencePct >= b.minConfidence && recommendationConfidencePct <= b.maxConfidence) || null;
@@ -775,6 +815,7 @@ export default function App() {
       console.warn("Failed to load score/outcomes", err);
       setReportScore(null);
       setOutcomesSummary(null);
+      setLatestTrackedOutcome(null);
       setThesisMemory(null);
       setPositionSizing(null);
       setRecommendation(null);
@@ -783,7 +824,9 @@ export default function App() {
     } finally {
       setLoadingScoreAndOutcomes(false);
     }
-  }, [country, selectedCompany, strategyInvestmentAmount]);
+    // judgeData read via judgeDataRef so this callback stays stable when judge/recency completes;
+    // otherwise useEffects that depend on loadScoreAndOutcomes re-run forever (Alpha scorecard flicker).
+  }, [country, selectedCompany, strategyInvestmentAmount, reportData]);
 
   const runJudgeValidation = useCallback(async () => {
     if (!selectedCompany) return;
@@ -838,6 +881,13 @@ export default function App() {
   }, [selectedCompany, showReport, reportData, loadSavedReports, runJudgeValidation, loadScoreAndOutcomes]);
 
   useEffect(() => {
+    if (activeTab !== 'decisionEngine' || !selectedCompany) return;
+    void loadSavedReports();
+    void runJudgeValidation();
+    void loadScoreAndOutcomes();
+  }, [activeTab, selectedCompany, loadSavedReports, runJudgeValidation, loadScoreAndOutcomes]);
+
+  useEffect(() => {
     if (!showPortfolioView || portfolioWorkspaceTab !== 'custom') return;
     (async () => {
       const next: Record<string, HoldingMetrics | null> = {};
@@ -865,12 +915,47 @@ export default function App() {
     () => buildFutureProjectionRows(reportData?.chartData || []),
     [reportData?.chartData]
   );
+  const lastPriceAsOf = useMemo(() => {
+    if (!priceCandles.length) return null;
+    return priceCandles[priceCandles.length - 1]?.date ?? null;
+  }, [priceCandles]);
+  const readerIntegrityNotes = useMemo(() => {
+    const notes: string[] = [];
+    if (reportData?.parsingWarnings?.length) notes.push(...reportData.parsingWarnings);
+    if (judgeData && !judgeData.passed) {
+      notes.push(`Quality gate: completeness ${judgeData.completenessScore}%. Treat AI narrative and headline scores as provisional.`);
+    }
+    return notes;
+  }, [reportData, judgeData]);
   const activeChartPalette = useMemo(() => {
     const mode = chartPaletteByCountry[country];
     if (mode === 'emerald') return { sales: '#059669', profit: '#0ea5e9', eps: '#f59e0b', projection: '#10b981', technical: '#2563eb' };
     if (mode === 'violet') return { sales: '#7c3aed', profit: '#ec4899', eps: '#f59e0b', projection: '#8b5cf6', technical: '#0891b2' };
     return { sales: '#3B82F6', profit: '#10B981', eps: '#F59E0B', projection: '#6366F1', technical: '#2563eb' };
   }, [chartPaletteByCountry, country]);
+
+  const effectiveReportScore = useMemo(
+    () => reportScore || (reportData ? buildReportScorecard(reportData, judgeData) : null),
+    [reportScore, reportData, judgeData]
+  );
+  const effectiveRecommendation = useMemo(() => {
+    if (recommendation) return recommendation;
+    if (!effectiveReportScore) return null;
+    const action: "buy" | "watch" | "avoid" = effectiveReportScore.totalScore >= 72 ? "buy" : effectiveReportScore.totalScore >= 52 ? "watch" : "avoid";
+    const riskClass: "low" | "medium" | "high" = effectiveReportScore.breakdown.risk >= 70 ? "low" : effectiveReportScore.breakdown.risk >= 45 ? "medium" : "high";
+    return {
+      action,
+      confidencePct: Math.max(5, Math.min(95, Math.round(effectiveReportScore.totalScore * 0.85))),
+      horizonDays: 90,
+      riskClass,
+      explainability: {
+        positive: [`quality:${effectiveReportScore.breakdown.quality}`, `valuation:${effectiveReportScore.breakdown.valuation}`],
+        negative: [`risk:${100 - effectiveReportScore.breakdown.risk}`],
+        caveats: ["Live session preview from in-memory report"],
+      },
+      scoreSnapshotTotal: effectiveReportScore.totalScore,
+    };
+  }, [recommendation, effectiveReportScore]);
 
   const runScanner = async (id: string) => {
     setSelectedScanner(id);
@@ -898,7 +983,7 @@ export default function App() {
     try {
       const json = await fetchAnnouncementsByType(type, country);
       if (json.success) {
-        setAnnouncements(json.data);
+        setAnnouncements(Array.isArray(json.data) ? json.data : []);
       } else {
         setError(getApiErrorMessage(json, 'Failed to fetch data'));
       }
@@ -926,15 +1011,17 @@ export default function App() {
     }
   };
 
-  const openCompanyDashboard = async (company: SavedCompany) => {
+  const openCompanyDashboard = async (company: SavedCompany, origin?: DashboardOrigin) => {
     if (activeTab === 'scanners') {
       setScannerWorkspaceTab('reports');
     }
+    setDashboardOrigin(origin ?? (activeTab === 'admin' ? 'discover' : activeTab));
     setSelectedCompany(company);
     setLoadingCompany(true);
     setCompanyData(null);
     setShowReport(false);
     setReportData(null);
+    setReportGeneratedAt(null);
     setError(null);
     try {
       const json = await fetchCompanyFundamentals(company.url, country);
@@ -961,6 +1048,7 @@ export default function App() {
       const json = await fetchCompanyReport(selectedCompany.url, country, reportType);
       if (json.success) {
         setReportData(json.data.data);
+        setReportGeneratedAt(new Date().toISOString());
         if (json.data.qualityGate) setJudgeData(json.data.qualityGate as QualityGateResult);
       } else {
         throw new Error(getApiErrorMessage(json, "Failed to fetch report data from server"));
@@ -1033,7 +1121,9 @@ export default function App() {
   };
 
   const shouldHideCompanyNameInReport = Boolean(selectedCompany && hideCompanyNameInReport && !reportCompanyNameRevealed);
-  const reportCompanyTitle = shouldHideCompanyNameInReport ? 'Hidden Company' : (selectedCompany?.name || 'Company');
+  const reportCompanyTitle = shouldHideCompanyNameInReport && selectedCompany?.name
+    ? 'X'.repeat(Math.max(1, selectedCompany.name.trim().length))
+    : (selectedCompany?.name || 'Company');
   const aiReportMarkdown = useMemo(() => {
     const raw = String(reportData?.aiReport || '');
     if (!raw) return raw;
@@ -1122,10 +1212,31 @@ export default function App() {
     didRunInitialTabEffect.current = true;
   }, [activeTab, country]);
 
+  const isResultAnnouncement = (category?: string, subject?: string) => {
+    const text = `${String(category || '')} ${String(subject || '')}`.toLowerCase();
+    if (!text.trim()) return false;
+    return (
+      text.includes('result') ||
+      text.includes('financial') ||
+      text.includes('earnings') ||
+      text.includes('quarterly') ||
+      text.includes('q1') ||
+      text.includes('q2') ||
+      text.includes('q3') ||
+      text.includes('q4') ||
+      text.includes('10-q') ||
+      text.includes('10-k') ||
+      text.includes('8-k') ||
+      text.includes('year ended') ||
+      text.includes('audited') ||
+      text.includes('unaudited')
+    );
+  };
+
   const filteredAnnouncements = announcements.filter(a => 
-    a.companyName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    a.symbol.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    a.subject.toLowerCase().includes(searchQuery.toLowerCase())
+    a.companyName.toLowerCase().includes(announcementSearchQuery.toLowerCase()) ||
+    a.symbol.toLowerCase().includes(announcementSearchQuery.toLowerCase()) ||
+    a.subject.toLowerCase().includes(announcementSearchQuery.toLowerCase())
   );
 
   const isCompanySaved = (id: string) => savedCompanies.some(c => c.id === id);
@@ -1220,17 +1331,24 @@ export default function App() {
               Admin
             </button>
           )}
-          {visiblePages.all && (
-            <button
-              onClick={() => setActiveTab('all')}
-              className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
-                activeTab === 'all' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
-              }`}
-            >
-              <FileText className="h-4 w-4" />
-              All Announcements
-            </button>
-          )}
+          <button
+            onClick={() => setActiveTab('all')}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+              activeTab === 'all' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+            }`}
+          >
+            <FileText className="h-4 w-4" />
+            All Announcements
+          </button>
+          <button
+            onClick={() => setActiveTab('discover')}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+              activeTab === 'discover' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+            }`}
+          >
+            <Sparkles className="h-4 w-4" />
+            Discover
+          </button>
           <button
             onClick={() => setActiveTab('results')}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -1238,7 +1356,7 @@ export default function App() {
             }`}
           >
             <TrendingUp className="h-4 w-4" />
-            Financial Results
+            Results
           </button>
           <button
             onClick={() => setActiveTab('companies')}
@@ -1258,17 +1376,24 @@ export default function App() {
             <Radar className="h-4 w-4" />
             Stock Scanners
           </button>
-          {(visiblePages.portfolio || hasAdminAccess) && (
-            <button
-              onClick={() => setActiveTab('portfolio')}
-              className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
-                activeTab === 'portfolio' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
-              }`}
-            >
-              <BarChart3 className="h-4 w-4" />
-              Portfolio
-            </button>
-          )}
+          <button
+            onClick={() => setActiveTab('portfolio')}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+              activeTab === 'portfolio' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+            }`}
+          >
+            <BarChart3 className="h-4 w-4" />
+            Portfolio
+          </button>
+          <button
+            onClick={() => setActiveTab('decisionEngine')}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+              activeTab === 'decisionEngine' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+            }`}
+          >
+            <Brain className="h-4 w-4" />
+            Decision Engine
+          </button>
           <button
             onClick={() => setActiveTab('saved')}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -1286,21 +1411,11 @@ export default function App() {
             <div className="p-6 bg-white rounded-xl border border-gray-200 shadow-sm">
               <h2 className="text-xl font-bold text-gray-900 mb-4">Admin Dashboard</h2>
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                <div className="space-y-4">
-                  <h3 className="font-semibold text-gray-800">Page Visibility</h3>
-                  {Object.entries(visiblePages).map(([page, isVisible]) => (
-                    <div key={page} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                      <span className="capitalize text-gray-700">{page}</span>
-                      <button
-                        onClick={() => togglePageVisibility(page, isVisible)}
-                        className={`px-3 py-1 rounded-md text-sm font-medium ${
-                          isVisible ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
-                        }`}
-                      >
-                        {isVisible ? 'Visible' : 'Hidden'}
-                      </button>
-                    </div>
-                  ))}
+                <div className="space-y-3 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                  <h3 className="font-semibold text-gray-800">Navigation</h3>
+                  <p className="text-sm text-gray-600">
+                    All main sections (Announcements, Discover, Results, Companies, Scanners, Portfolio, Decision Engine, Saved) are always shown in the top navigation.
+                  </p>
                 </div>
 
                 <div className="space-y-4">
@@ -1517,6 +1632,34 @@ export default function App() {
                         </div>
                       </div>
                     )}
+                    <div className="mt-6 border-t border-gray-200 pt-4">
+                      <h4 className="text-sm font-semibold text-gray-900 mb-2">
+                        Basket holdings ({selectedStrategyPf.stocks.length})
+                      </h4>
+                      <p className="text-xs text-gray-600 mb-3">
+                        Stocks in this model portfolio (performance loads separately via Yahoo-backed pricing).
+                      </p>
+                      <div className="overflow-x-auto max-h-72 overflow-y-auto rounded-lg border border-gray-200 bg-white">
+                        <table className="min-w-full text-sm">
+                          <thead className="sticky top-0 bg-gray-50 text-xs text-gray-600 uppercase border-b border-gray-200">
+                            <tr>
+                              <th className="px-3 py-2 text-left font-medium">Symbol</th>
+                              <th className="px-3 py-2 text-left font-medium">Company</th>
+                              <th className="px-3 py-2 text-left font-medium hidden sm:table-cell">Thesis</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {selectedStrategyPf.stocks.map((s) => (
+                              <tr key={s.symbol} className="hover:bg-gray-50">
+                                <td className="px-3 py-2 font-mono text-xs text-gray-800 whitespace-nowrap">{s.symbol}</td>
+                                <td className="px-3 py-2 text-gray-900">{s.name}</td>
+                                <td className="px-3 py-2 text-gray-600 text-xs hidden sm:table-cell max-w-md">{s.thesis}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
                   </>
                 )}
               </div>
@@ -1690,6 +1833,28 @@ export default function App() {
               )}
             </div>
           )}
+          {activeTab === 'decisionEngine' && (
+            <DecisionEngineScreen
+              onNavigate={(tab) => setActiveTab(tab)}
+              deepAnalysis={{
+                symbol: selectedCompany ? (selectedCompany.symbol || selectedCompany.id) : null,
+                country,
+                loadingJudge,
+                loadingScoreAndOutcomes,
+                reportData,
+                showReport,
+                judgeData,
+                recencyValidation,
+                reportScore: effectiveReportScore,
+                recommendation: effectiveRecommendation,
+                recommendationPolicy,
+                recommendationCalibration,
+                positionSizing,
+                thesisMemory,
+                savedReportsCount: savedReports.length,
+              }}
+            />
+          )}
           {activeTab === 'discover' && (
             <div className="p-6">
               <div className="flex justify-between items-center mb-6">
@@ -1709,7 +1874,20 @@ export default function App() {
                 </button>
               </div>
 
-              {loading && announcements.length === 0 ? (
+              {error ? (
+                <div className="state-panel">
+                  <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
+                  <h3 className="font-semibold text-gray-900">Unable to load Discover feed</h3>
+                  <p className="text-sm text-gray-500 mt-1 mb-4">{error}</p>
+                  <button
+                    onClick={() => fetchAnnouncements('results')}
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-gray-900 text-white text-sm font-medium hover:bg-gray-800"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    Retry
+                  </button>
+                </div>
+              ) : loading && announcements.length === 0 ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {[1, 2, 3, 4, 5, 6].map(i => (
                     <div key={i} className="animate-pulse bg-gray-50 rounded-xl p-6 border border-gray-100 h-48"></div>
@@ -1717,7 +1895,9 @@ export default function App() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {announcements.filter(a => a.category === 'Result').slice(0, 12).map((item) => (
+                  {announcements
+                    .slice(0, 12)
+                    .map((item) => (
                     <div key={item.id} className="group bg-white rounded-xl p-6 border border-gray-200 hover:border-blue-300 hover:shadow-md transition-all">
                       <div className="flex justify-between items-start mb-4">
                         <div className="bg-blue-50 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider">
@@ -1757,12 +1937,12 @@ export default function App() {
                               exchange: item.exchange,
                               symbol: item.symbol
                             };
-                            openCompanyDashboard(company);
+                            openCompanyDashboard(company, 'discover');
                           }}
                           className="flex-1 flex items-center justify-center gap-2 py-2 bg-blue-600 text-white text-xs font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
                         >
                           <Sparkles className="h-3.5 w-3.5" />
-                          AI Analysis
+                          Open Analysis
                         </button>
                         <button
                           onClick={() => {
@@ -1798,7 +1978,7 @@ export default function App() {
                       </div>
                     </div>
                   ))}
-                  {announcements.filter(a => a.category === 'Result').length === 0 && (
+                  {announcements.length === 0 && (
                     <div className="col-span-full py-20 text-center text-gray-500 bg-gray-50 rounded-xl border border-dashed border-gray-300">
                       <FileText className="h-10 w-10 mx-auto mb-3 text-gray-300" />
                       <p>No recent results found. Try refreshing or changing country.</p>
@@ -1822,8 +2002,8 @@ export default function App() {
                     <input
                       type="text"
                       placeholder="Search company or subject..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
+                      value={announcementSearchQuery}
+                      onChange={(e) => setAnnouncementSearchQuery(e.target.value)}
                       className="w-full pl-9 pr-4 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     />
                   </div>
@@ -1888,7 +2068,7 @@ export default function App() {
                             </td>
                             <td className="px-4 py-3 text-right">
                               <div className="flex items-center justify-end gap-3">
-                                {item.category === 'Result' && (
+                                {isResultAnnouncement(item.category, item.subject) && (
                                   <>
                                     <button
                                       onClick={() => addToCustomPortfolio({ symbol: item.symbol, name: item.companyName })}
@@ -1909,12 +2089,12 @@ export default function App() {
                                           exchange: item.exchange,
                                           symbol: item.symbol
                                         };
-                                        openCompanyDashboard(company);
+                                        openCompanyDashboard(company, 'results');
                                       }}
                                       className="inline-flex items-center gap-1 text-amber-600 hover:text-amber-800 font-medium text-xs bg-amber-50 px-2 py-1 rounded border border-amber-100 transition-colors"
                                     >
                                       <Sparkles className="h-3 w-3" />
-                                      Analyze
+                                      Open Analysis
                                     </button>
                                     <button
                                       onClick={() => {
@@ -1970,11 +2150,15 @@ export default function App() {
               selectedScanner={selectedScanner}
               setSelectedScanner={setSelectedScanner}
               loadingScanner={loadingScanner}
+              scannerError={error}
               scannerResults={scannerResults}
               strategies={STRATEGIES}
               isPaidCustomer={isPaidCustomer}
               setIsPaidCustomer={setIsPaidCustomer}
               runScanner={runScanner}
+              retryScanner={() => {
+                if (selectedScanner) runScanner(selectedScanner);
+              }}
               openCompanyDashboard={openCompanyDashboard}
               addToCustomPortfolio={addToCustomPortfolio}
               toggleSaveCompany={toggleSaveCompany}
@@ -1989,7 +2173,7 @@ export default function App() {
                 <Building2 className="h-12 w-12 text-gray-300 mx-auto mb-4" />
                 <h3 className="text-lg font-medium text-gray-900">Companies Directory</h3>
                 <p className="text-gray-500 mt-2 max-w-md mx-auto">
-                  Search and explore listed companies across BSE.
+                  Search and explore listed companies across {country === 'IN' ? 'NSE/BSE' : 'US exchanges'}.
                 </p>
                 <div className="mt-6 max-w-md mx-auto relative">
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" />
@@ -2004,7 +2188,13 @@ export default function App() {
                 </div>
               </div>
               
-              {searchingCompanies ? (
+              {error ? (
+                <div className="state-panel mt-8">
+                  <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
+                  <h3 className="font-semibold text-gray-900">Company search failed</h3>
+                  <p className="text-sm text-gray-500 mt-1">{error}</p>
+                </div>
+              ) : searchingCompanies ? (
                 <div className="text-center py-8">
                   <RefreshCw className="h-8 w-8 animate-spin mx-auto text-blue-500 mb-4" />
                   <p className="text-gray-500">Searching directories...</p>
@@ -2014,7 +2204,7 @@ export default function App() {
                   {companies.map((company) => (
                     <button 
                       key={company.id}
-                      onClick={() => openCompanyDashboard(company)}
+                      onClick={() => openCompanyDashboard(company, 'companies')}
                       className="block p-4 bg-white border border-gray-200 rounded-lg hover:border-blue-500 hover:shadow-md transition-all group text-left w-full"
                     >
                       <div className="flex justify-between items-start">
@@ -2054,10 +2244,18 @@ export default function App() {
               ) : (
                 <div className="grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
                   {savedCompanies.map((company) => (
-                    <button 
+                    <div
                       key={company.id}
-                      onClick={() => openCompanyDashboard(company)}
-                      className="block p-4 bg-white border border-gray-200 rounded-lg hover:border-blue-500 hover:shadow-md transition-all group text-left w-full relative"
+                      onClick={() => openCompanyDashboard(company, 'saved')}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          openCompanyDashboard(company, 'saved');
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      className="block p-4 bg-white border border-gray-200 rounded-lg hover:border-blue-500 hover:shadow-md transition-all group text-left w-full relative cursor-pointer"
                     >
                       <div className="flex justify-between items-start pr-8">
                         <div>
@@ -2067,7 +2265,9 @@ export default function App() {
                           </span>
                         </div>
                       </div>
-                      <div 
+                      <button
+                        type="button"
+                        aria-label={`Remove ${company.name} from saved companies`}
                         className="absolute top-4 right-4 text-blue-600 hover:text-blue-800 p-1"
                         onClick={(e) => {
                           e.stopPropagation();
@@ -2075,8 +2275,8 @@ export default function App() {
                         }}
                       >
                         <BookmarkCheck className="h-5 w-5" />
-                      </div>
-                    </button>
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -2092,7 +2292,7 @@ export default function App() {
                   className="flex items-center gap-2 text-gray-600 hover:text-gray-900 transition-colors"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  Back to {activeTab === 'saved' ? 'Saved' : 'Search'}
+                  Back to {dashboardOrigin === 'saved' ? 'Saved' : dashboardOrigin === 'companies' ? 'Companies' : dashboardOrigin === 'scanners' ? 'Scanners' : dashboardOrigin === 'portfolio' ? 'Portfolio' : dashboardOrigin === 'all' ? 'Announcements' : dashboardOrigin === 'decisionEngine' ? 'Decision Engine' : 'Discover'}
                 </button>
                 
                 <div className="flex items-center gap-2">
@@ -2139,6 +2339,19 @@ export default function App() {
                   setReportCompanyNameRevealed(false);
                 }}
                 onGenerateReport={generateReport}
+                dataProvenance={
+                  showReport && reportData
+                    ? {
+                        reportGeneratedAt,
+                        priceAsOf: lastPriceAsOf,
+                        judgeCheckedAt: judgeData?.checkedAt ?? null,
+                        fundamentalsNote:
+                          country === "IN"
+                            ? "Screener-style tables: ₹ crores and ₹ EPS where labeled; peer to filings."
+                            : "USD reporting; line items depend on the listing and filing feed.",
+                      }
+                    : undefined
+                }
               />
 
               {showReport ? (
@@ -2179,6 +2392,8 @@ export default function App() {
                         hideCompanyNameInReport={hideCompanyNameInReport}
                         reportCompanyNameRevealed={reportCompanyNameRevealed}
                         selectedCompanyName={selectedCompany.name}
+                        symbol={selectedCompany.symbol || selectedCompany.id || ""}
+                        country={country}
                         isPaidCustomer={isPaidCustomer}
                         setIsPaidCustomer={setIsPaidCustomer}
                         setReportCompanyNameRevealed={setReportCompanyNameRevealed}
@@ -2191,17 +2406,19 @@ export default function App() {
                         loadingSavedReports={loadingSavedReports}
                         savedReports={savedReports}
                         onRefreshSavedReports={() => void loadSavedReports()}
-                        reportScore={reportScore}
+                        reportScore={effectiveReportScore}
                         outcomesSummary={outcomesSummary ? {
                           horizonDays: outcomesSummary.horizonDays,
                           hitRatePct: outcomesSummary.hitRatePct,
                           avgReturnPct: outcomesSummary.avgReturnPct,
                           usableRows: outcomesSummary.usableRows,
+                          totalRows: outcomesSummary.totalRows,
+                          asOf: outcomesSummary.asOf,
+                          methodology: outcomesSummary.methodology,
                         } : null}
+                        latestTrackedOutcome={latestTrackedOutcome}
                         loadingScoreAndOutcomes={loadingScoreAndOutcomes}
-                        degradedSourceWarnings={(reportData.parsingWarnings || []).length
-                          ? reportData.parsingWarnings || []
-                          : (judgeData?.missingComponents || []).filter((m) => m.includes("unreadable") || m.includes("missing"))}
+                        readerIntegrityNotes={readerIntegrityNotes}
                         thesisMemory={thesisMemory ? {
                           thesis: thesisMemory.thesis,
                           status: thesisMemory.status,
@@ -2216,9 +2433,24 @@ export default function App() {
                             maxPositionValue: s.maxPositionValue,
                           })),
                         } : null}
-                        recommendation={recommendation}
+                        recommendation={effectiveRecommendation}
                         recommendationCalibration={recommendationCalibration}
                         recommendationPolicyVersion={recommendationPolicy?.version || null}
+                        snapshotStrip={{
+                          reportGeneratedAt,
+                          priceAsOf: lastPriceAsOf,
+                          judgeCheckedAt: judgeData?.checkedAt ?? null,
+                          sourceUrl: selectedCompany.url,
+                          reportType,
+                          quoteSummary: reportData.summary
+                            ? {
+                                price: reportData.summary.price,
+                                marketCap: reportData.summary.marketCap,
+                                pe: reportData.summary.pe,
+                                source: reportData.summary.source,
+                              }
+                            : null,
+                        }}
                       />
                     </div>
                   ) : (

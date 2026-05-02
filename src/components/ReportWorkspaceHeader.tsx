@@ -1,6 +1,17 @@
 import { ExternalLink, RefreshCw, Sparkles } from "lucide-react";
 import type { ReportType } from "../../shared/reportTypes";
 
+type DataProvenanceStrip = {
+  /** ISO timestamp when this report payload was fetched */
+  reportGeneratedAt: string | null;
+  /** Last daily candle date used for technicals (if loaded) */
+  priceAsOf: string | null;
+  /** Judge / quality gate run time */
+  judgeCheckedAt: string | null;
+  /** Units and source hint for fundamentals tables */
+  fundamentalsNote: string;
+};
+
 type ReportWorkspaceHeaderProps = {
   companyName: string;
   companyExchange: string;
@@ -12,6 +23,8 @@ type ReportWorkspaceHeaderProps = {
   onReportTypeChange: (value: ReportType) => void;
   onHideCompanyNameChange: (checked: boolean) => void;
   onGenerateReport: () => void;
+  /** As-of line for data transparency */
+  dataProvenance?: DataProvenanceStrip;
 };
 
 export default function ReportWorkspaceHeader({
@@ -25,9 +38,10 @@ export default function ReportWorkspaceHeader({
   onReportTypeChange,
   onHideCompanyNameChange,
   onGenerateReport,
+  dataProvenance,
 }: ReportWorkspaceHeaderProps) {
   return (
-    <div className="mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+    <div className="section-shell mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
       <div>
         <h2 className={`text-2xl font-bold text-gray-900 transition-all ${!isPaidCustomer ? "blur-md select-none" : ""}`}>
           {isPaidCustomer ? companyName : "HIDDEN COMPANY NAME"}
@@ -51,6 +65,26 @@ export default function ReportWorkspaceHeader({
             View on Screener <ExternalLink className="h-3 w-3" />
           </a>
         </div>
+        {dataProvenance && (
+          <dl className="mt-3 grid gap-1 text-xs text-gray-600 max-w-xl border-t border-gray-100 pt-3">
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+              <dt className="font-medium text-gray-500">Report data</dt>
+              <dd>{dataProvenance.reportGeneratedAt ? new Date(dataProvenance.reportGeneratedAt).toLocaleString() : "—"}</dd>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+              <dt className="font-medium text-gray-500">Price series</dt>
+              <dd>{dataProvenance.priceAsOf ? dataProvenance.priceAsOf : "—"}</dd>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+              <dt className="font-medium text-gray-500">Quality gate</dt>
+              <dd>{dataProvenance.judgeCheckedAt ? new Date(dataProvenance.judgeCheckedAt).toLocaleString() : "—"}</dd>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+              <dt className="font-medium text-gray-500">Tables</dt>
+              <dd className="text-gray-600">{dataProvenance.fundamentalsNote}</dd>
+            </div>
+          </dl>
+        )}
       </div>
 
       <div className="flex flex-col items-start sm:items-end gap-2">
@@ -85,7 +119,7 @@ export default function ReportWorkspaceHeader({
           ) : (
             <Sparkles className="h-4 w-4" />
           )}
-          Generate {reportType === "deep" ? "Deep Report" : reportType === "quick" ? "Quick Report" : "AI Report"}
+          Generate {reportType === "deep" ? "Deep Analysis" : reportType === "quick" ? "Quick Analysis" : "Standard Analysis"}
         </button>
       </div>
     </div>

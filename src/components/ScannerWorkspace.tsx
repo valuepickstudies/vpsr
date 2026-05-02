@@ -18,11 +18,13 @@ type ScannerWorkspaceProps = {
   selectedScanner: string | null;
   setSelectedScanner: (id: string | null) => void;
   loadingScanner: boolean;
+  scannerError?: string | null;
   scannerResults: CompanySearchResult[];
   strategies: ScannerStrategy[];
   isPaidCustomer: boolean;
   setIsPaidCustomer: (value: boolean) => void;
   runScanner: (id: string) => void;
+  retryScanner: () => void;
   openCompanyDashboard: (company: CompanySearchResult) => void;
   addToCustomPortfolio: (company: CompanySearchResult) => void;
   toggleSaveCompany: (company: CompanySearchResult) => void;
@@ -37,11 +39,13 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
     selectedScanner,
     setSelectedScanner,
     loadingScanner,
+    scannerError,
     scannerResults,
     strategies,
     isPaidCustomer,
     setIsPaidCustomer,
     runScanner,
+    retryScanner,
     openCompanyDashboard,
     addToCustomPortfolio,
     toggleSaveCompany,
@@ -75,7 +79,19 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
                     runScanner(strategy.id);
                   }
                 }}
-                className={`bg-white rounded-xl border p-6 shadow-sm transition-all cursor-pointer group relative overflow-hidden ${strategy.premium && !isPaidCustomer ? "border-amber-200 bg-amber-50/30" : "border-gray-200 hover:shadow-md"}`}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    if (strategy.premium && !isPaidCustomer) {
+                      setIsPaidCustomer(false);
+                    } else {
+                      runScanner(strategy.id);
+                    }
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                className={`w-full text-left bg-white rounded-xl border p-6 shadow-sm transition-all cursor-pointer group relative overflow-hidden ${strategy.premium && !isPaidCustomer ? "border-amber-200 bg-amber-50/30" : "border-gray-200 hover:shadow-md"}`}
               >
                 {strategy.premium && (
                   <div className="absolute top-0 right-0">
@@ -127,7 +143,21 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
             </p>
           </div>
 
-          {loadingScanner ? (
+          {scannerError ? (
+            <div className="state-panel">
+              <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
+              <h3 className="text-base font-semibold text-gray-900">Scanner run failed</h3>
+              <p className="text-sm text-gray-500 mt-1 mb-4">{scannerError}</p>
+              <button
+                type="button"
+                onClick={retryScanner}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-gray-900 text-white text-sm font-medium hover:bg-gray-800"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Retry scanner
+              </button>
+            </div>
+          ) : loadingScanner ? (
             <div className="text-center py-12">
               <RefreshCw className="h-8 w-8 animate-spin mx-auto text-blue-500 mb-4" />
               <p className="text-gray-500">Running scanner across all listed companies...</p>
@@ -137,10 +167,18 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
               {scannerResults.map((company) => (
                 <div
                   key={company.id}
-                  className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow cursor-pointer"
+                  className="w-full text-left bg-white p-5 rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow cursor-pointer"
                   onClick={() => {
                     openCompanyDashboard(company);
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      openCompanyDashboard(company);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                 >
                   <div className="flex justify-between items-start mb-3 gap-2">
                     <h4 className="font-bold text-gray-900 text-lg line-clamp-1">{company.name}</h4>
@@ -160,6 +198,7 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
                           toggleSaveCompany(company);
                         }}
                         className="text-gray-400 hover:text-blue-600 transition-colors"
+                        aria-label={isCompanySaved(company.id) ? `Remove ${company.name} from saved` : `Save ${company.name}`}
                       >
                         {isCompanySaved(company.id) ? (
                           <BookmarkCheck className="h-5 w-5 text-blue-600" />
@@ -173,7 +212,7 @@ export default function ScannerWorkspace(props: ScannerWorkspaceProps) {
                     <span className="px-2 py-1 bg-gray-100 rounded text-xs font-medium">{company.exchange}</span>
                   </div>
                   <div className="flex items-center text-sm font-medium text-blue-600 group-hover:text-blue-800">
-                    View Analysis <ArrowLeft className="h-4 w-4 ml-1 rotate-180" />
+                    Open Analysis <ArrowLeft className="h-4 w-4 ml-1 rotate-180" />
                   </div>
                 </div>
               ))}

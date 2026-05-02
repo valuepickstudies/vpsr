@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assessReportQuality, parseScreenerFinancials } from "../reportUtils";
+import { OUTCOMES_METHODOLOGY } from "../shared/outcomesTransparency";
+import { assessReportQuality, buildFutureProjectionRows, extractYearFromPeriodLabel, parseScreenerFinancials } from "../reportUtils";
 import type { CompanyReportData } from "../shared/reportTypes";
 
 const screenerFixture = `
@@ -87,5 +88,30 @@ test("assessReportQuality passes for complete report", () => {
   const gate = assessReportQuality(report, "2026-03-31T00:00:00.000Z");
   assert.equal(gate.passed, true);
   assert.equal(gate.completenessScore >= 60, true);
+});
+
+test("extractYearFromPeriodLabel reads calendar year from Screener-style labels", () => {
+  assert.equal(extractYearFromPeriodLabel("Mar 2026"), 2026);
+  assert.equal(extractYearFromPeriodLabel("FY2024"), 2024);
+});
+
+test("buildFutureProjectionRows yields finite rows with fiscal-style labels (no NaN)", () => {
+  const rows = buildFutureProjectionRows([
+    { year: "Mar 2023", sales: 100, netProfit: 10, eps: 1 },
+    { year: "Mar 2024", sales: 110, netProfit: 11, eps: 1.1 },
+    { year: "Mar 2025", sales: 120, netProfit: 12, eps: 1.2 },
+    { year: "Mar 2026", sales: 130, netProfit: 13, eps: 1.3 },
+  ]);
+  assert.equal(rows.length, 3);
+  for (const r of rows) {
+    assert.equal(Number.isFinite(r.sales) && Number.isFinite(r.netProfit), true);
+    assert.match(r.year, /^Mar 202\d \(proj\)$/);
+  }
+});
+
+test("outcomes methodology copy is defined for API readers", () => {
+  assert.ok(OUTCOMES_METHODOLOGY.hitDefinition.length > 40);
+  assert.ok(OUTCOMES_METHODOLOGY.entryRule.length > 20);
+  assert.ok(OUTCOMES_METHODOLOGY.benchmarkNote.length > 20);
 });
 
